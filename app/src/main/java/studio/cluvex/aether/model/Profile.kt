@@ -366,6 +366,11 @@ data class ConnectionProfile(
      */
     fun connectTimeoutMs(): Long {
         if (hasManualPeer) return 45_000L
+        // WARP-in-WARP has two sequential WireGuard establishment phases
+        // (outer endpoint selection + inner tunnel establishment). Its SOCKS5
+        // listener is intentionally opened only after the inner stack is ready,
+        // so it needs a larger startup budget than single-layer protocols.
+        if (protocol == Protocol.GOOL) return 600_000L
         return when (scanMode) {
             ScanMode.TURBO -> 60_000L
             ScanMode.BALANCED -> 150_000L

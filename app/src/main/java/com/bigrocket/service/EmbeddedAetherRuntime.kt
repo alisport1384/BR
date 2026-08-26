@@ -46,10 +46,15 @@ object EmbeddedAetherRuntime {
                 process = engine
                 engine.start(embeddedProfile)
                 AetherController.setState(ConnectionState.Connecting)
+                // GOOL establishes two sequential WireGuard layers before the
+                // native SOCKS5 listener is created. Use the protocol's full
+                // startup budget here instead of failing while the inner tunnel
+                // is still legitimately being established.
+                val startupTimeoutMs = embeddedProfile.connectTimeoutMs().coerceAtLeast(10_000L)
                 val open = PortProbe.awaitOpen(
                     TunnelConfig.SOCKS_HOST,
                     TunnelConfig.SOCKS_PORT,
-                    embeddedProfile.connectTimeoutMs().toLong().coerceAtLeast(10_000L),
+                    startupTimeoutMs,
                     isEngineAlive = { engine.isAlive() },
                 )
                 if (!open) error("Aether SOCKS5 listener did not become ready")
