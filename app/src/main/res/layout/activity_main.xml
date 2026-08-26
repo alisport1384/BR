@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+    <TextView
+        android:id="@+id/tvWifiStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Wi-Fi: در حال بررسی..."
+        android:textSize="15sp" />
+
+    <TextView
+        android:id="@+id/tvCellularStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Cellular: در حال بررسی..."
+        android:textSize="15sp" />
+
+    <TextView
+        android:id="@+id/tvAiStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="وضعیت AI: IDLE"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvAiLog"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="#10000000"
+        android:padding="12dp"
+        android:text="لاگ زنده هوش مصنوعی..."
+        android:textColor="#2E7D32"
+        android:textSize="14sp"
+        android:textStyle="italic" />
+
+    <TextView
+        android:id="@+id/tvMode"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="مود سیستم: Single-Path"
+        android:textSize="15sp" />
+
+    <TextView
+        android:id="@+id/tvSpeed"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="سرعت ترکیبی: 0.0 Mbps"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+
+    <!-- Simple, cheap-to-render split bar: shows the live Wi-Fi vs Cellular routing share.
+         Plain weighted views only, no custom drawing - updated by changing layout_weight. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="14dp"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
+
+        <View
+            android:id="@+id/barWifi"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="#2196F3" />
+
+        <View
+            android:id="@+id/barCellular"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="#FF9800" />
+
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvBarLegend"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Wi-Fi 0% · Cellular 0%"
+        android:textSize="12sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="روند سرعت (Mbps)"
+        android:textSize="13sp" />
+
+    <com.bigrocket.ui.SimpleLineChartView
+        android:id="@+id/chartThroughput"
+        android:layout_width="match_parent"
+        android:layout_height="100dp"
+        android:layout_marginTop="4dp" />
+
+    <TextView
+        android:id="@+id/tvVpnStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:text="وضعیت VPN: غیرفعال"
+        android:textSize="15sp" />
+
+    <Button
+        android:id="@+id/btnToggleVpn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="شروع اتصال VPN" />
+
+
+    <TextView
+        android:id="@+id/tvAetherMode"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="مسیر بعد از Bonding: فقط BigRocket"
+        android:textSize="15sp" />
+
+    <Spinner
+        android:id="@+id/spinnerAetherMode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp" />
+
+    <androidx.compose.ui.platform.ComposeView
+        android:id="@+id/aetherEmbeddedPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp" />
+
+
+</LinearLayout>
+</ScrollView>
