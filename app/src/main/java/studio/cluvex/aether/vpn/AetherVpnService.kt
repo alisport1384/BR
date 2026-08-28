@@ -17,7 +17,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import studio.cluvex.aether.AetherApp
 import studio.cluvex.aether.MainActivity
-import studio.cluvex.aether.R
 import studio.cluvex.aether.core.AetherController
 import studio.cluvex.aether.core.AetherProcess
 import studio.cluvex.aether.core.Diagnostics

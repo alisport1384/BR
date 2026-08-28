@@ -42,7 +42,7 @@ object EmbeddedAetherRuntime {
                 EngineMeta.reset()
                 val embeddedProfile = profile.copy(proxyMode = true)
                 ProfileStore(app).save(embeddedProfile)
-                val engine = AetherProcess(app)
+                val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
                 process = engine
                 engine.start(embeddedProfile)
                 AetherController.setState(ConnectionState.Connecting)

@@ -1,7 +1,7 @@
 package studio.cluvex.aether.core
 
 import android.util.Log
-import studio.cluvex.aether.BuildConfig
+import com.bigrocket.BuildConfig
 import studio.cluvex.aether.model.ConnectionProfile
 import java.io.File
 

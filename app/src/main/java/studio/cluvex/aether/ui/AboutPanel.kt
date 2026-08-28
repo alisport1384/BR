@@ -38,8 +38,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import studio.cluvex.aether.BuildConfig
-import studio.cluvex.aether.R
+import com.bigrocket.BuildConfig
 
 private const val URL_ORIGINAL_GITHUB = "https://github.com/CluvexStudio/Aether"
 private const val URL_ORIGINAL_TELEGRAM = "https://t.me/CluvexStudio"

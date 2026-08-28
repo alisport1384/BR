@@ -47,7 +47,6 @@ import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.runtime.collectAsState
 import android.widget.Toast
 import kotlinx.coroutines.launch
-import studio.cluvex.aether.R
 import studio.cluvex.aether.core.CheckState
 import studio.cluvex.aether.core.ComponentCheck
 import studio.cluvex.aether.core.Diagnostics

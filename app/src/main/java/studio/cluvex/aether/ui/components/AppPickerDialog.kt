@@ -38,7 +38,6 @@ import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.LaunchedEffect
-import studio.cluvex.aether.R
 
 /** One installed app the user can pick for split tunneling. */
 data class AppEntry(val packageName: String, val label: String)

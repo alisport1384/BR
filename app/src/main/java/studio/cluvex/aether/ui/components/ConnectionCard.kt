@@ -72,7 +72,6 @@ import androidx.compose.ui.unit.sp
 import java.util.Locale
 import kotlin.math.sin
 import kotlinx.coroutines.delay
-import studio.cluvex.aether.R
 import studio.cluvex.aether.core.EngineMeta
 import studio.cluvex.aether.core.HevTunnel
 import studio.cluvex.aether.core.IpEndpoint
