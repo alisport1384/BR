@@ -16,17 +16,17 @@ object NetworkPreferenceStore {
     private const val DEFAULT_SCORE = 1
 
     fun wifiScore(context: Context): Int =
-        prefs(context).getInt(WIFI_SCORE_KEY, DEFAULT_SCORE).coerceIn(1, 4)
+        prefs(context).getInt(WIFI_SCORE_KEY, DEFAULT_SCORE).coerceIn(1, 5)
 
     fun cellularScore(context: Context): Int =
-        prefs(context).getInt(CELLULAR_SCORE_KEY, DEFAULT_SCORE).coerceIn(1, 4)
+        prefs(context).getInt(CELLULAR_SCORE_KEY, DEFAULT_SCORE).coerceIn(1, 5)
 
     fun setWifiScore(context: Context, score: Int) {
-        prefs(context).edit().putInt(WIFI_SCORE_KEY, score.coerceIn(1, 4)).apply()
+        prefs(context).edit().putInt(WIFI_SCORE_KEY, score.coerceIn(1, 5)).apply()
     }
 
     fun setCellularScore(context: Context, score: Int) {
-        prefs(context).edit().putInt(CELLULAR_SCORE_KEY, score.coerceIn(1, 4)).apply()
+        prefs(context).edit().putInt(CELLULAR_SCORE_KEY, score.coerceIn(1, 5)).apply()
     }
 
     private fun prefs(context: Context) =

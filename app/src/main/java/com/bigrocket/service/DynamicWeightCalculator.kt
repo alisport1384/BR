@@ -34,16 +34,16 @@ object DynamicWeightCalculator {
     private var currentWeights = NetworkWeights(50, 50)
 
     /**
-     * Configures the persistent user preference. Valid range is 1..4 for each path.
+     * Configures the persistent user preference. Valid range is 1..5 for each path.
      *
      * The requested mapping is intentionally expressed as a preference delta: every point of
-     * score difference moves 20 percentage points from the lower-scored path to the higher-scored
-     * path, so the explicit 2-vs-1 example becomes 70/30. Equal scores remain 50/50.
+     * score difference moves 10 percentage points from the lower-scored path to the higher-scored
+     * path. Score 1 is the neutral baseline: equal scores remain 50/50, while 2-vs-1 is 60/40.
      */
     @Synchronized
     fun configureUserScores(wifiScore: Int, cellularScore: Int) {
-        wifiUserScore = wifiScore.coerceIn(1, 4)
-        cellularUserScore = cellularScore.coerceIn(1, 4)
+        wifiUserScore = wifiScore.coerceIn(1, 5)
+        cellularUserScore = cellularScore.coerceIn(1, 5)
         currentWeights = preferredWeights()
     }
 
@@ -139,7 +139,7 @@ object DynamicWeightCalculator {
     fun currentWeights(): NetworkWeights = currentWeights
 
     private fun preferredWeights(): NetworkWeights {
-        val delta = ((cellularUserScore - wifiUserScore) * 20).coerceIn(-40, 40)
+        val delta = ((cellularUserScore - wifiUserScore) * 10).coerceIn(-40, 40)
         val cellular = (50 + delta).coerceIn(10, 90)
         return NetworkWeights(100 - cellular, cellular)
     }

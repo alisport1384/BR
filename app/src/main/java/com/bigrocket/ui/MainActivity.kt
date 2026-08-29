@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupNetworkScoreControls() {
-        val values = arrayOf("1", "2", "3", "4")
+        val values = arrayOf("1", "2", "3", "4", "5")
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
 
         spinnerWifiScore.adapter = adapter
