@@ -417,10 +417,22 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 val wifi = wifiNetwork
                 val cellular = cellularNetwork
 
-                val wifiLatency = wifi?.let { LatencyTester.testLatency(this@BigRocketVpnService, it) }
-                    ?: LatencyTester.FAILURE
-                val cellularLatency = cellular?.let { LatencyTester.testLatency(this@BigRocketVpnService, it) }
-                    ?: LatencyTester.FAILURE
+                // Probed concurrently: sequential probing meant a timed-out path (up to
+                // timeoutMs) fully blocked the other path's measurement on the same cycle,
+                // which in turn delayed the failure-hysteresis counters below and slowed
+                // down exactly the failover this loop exists to drive.
+                val (wifiLatency, cellularLatency) = coroutineScope {
+                    val wifiDeferred = wifi?.let {
+                        async(Dispatchers.IO) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
+                    }
+                    val cellularDeferred = cellular?.let {
+                        async(Dispatchers.IO) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
+                    }
+                    Pair(
+                        wifiDeferred?.await() ?: LatencyTester.FAILURE,
+                        cellularDeferred?.await() ?: LatencyTester.FAILURE
+                    )
+                }
 
                 // A path only counts as unavailable when the probe genuinely fails (timeout,
                 // refused, etc.) - a slow-but-successful probe (e.g. Wi-Fi waking from radio
