@@ -15,7 +15,7 @@
     <application
         android:name=".BigRocketApp"
         android:allowBackup="true"
-        android:icon="@android:mipmap/sym_def_app_icon"
+        android:icon="@drawable/ic_bigrocket"
         android:label="BigRocket VPN"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"

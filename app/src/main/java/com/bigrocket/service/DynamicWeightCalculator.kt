@@ -1,18 +1,28 @@
 package com.bigrocket.service
 
+import kotlin.math.abs
+
 /**
- * Session-scoped quality decision state for the two physical paths.
+ * Session-scoped quality decision cache for the two physical paths.
  *
- * User scores define the preferred/default split. There is deliberately no startup
- * sampling window or rolling 1..5 second cache: every quality update is evaluated
- * immediately from the latest successful latency measurement. The state is cleared
- * on a full disconnect and on path recovery; user scores are not session state.
+ * User scores define the preferred/default split. Quality history may change that split only
+ * after the rolling five-sample window proves a meaningful advantage. The quality cache is
+ * cleared on a full disconnect and on path recovery; user scores are not cache state.
  */
 object DynamicWeightCalculator {
 
+    private const val WINDOW_SIZE = 5
+    private const val MIN_SAMPLES_FOR_DECISION = WINDOW_SIZE
     private const val ADVANTAGE_RATIO = 1.10
     private const val MAX_WEIGHT = 85
     private const val MIN_WEIGHT = 15
+
+    private data class Sample(
+        val wifiLatencyMs: Long,
+        val cellularLatencyMs: Long
+    )
+
+    private val samples = ArrayDeque<Sample>(WINDOW_SIZE)
 
     @Volatile
     private var wifiUserScore = 1
@@ -25,8 +35,10 @@ object DynamicWeightCalculator {
 
     /**
      * Configures the persistent user preference. Valid range is 1..5 for each path.
-     * Every point of score difference moves 10 percentage points from the lower-scored
-     * path to the higher-scored path. Equal scores remain 50/50.
+     *
+     * The requested mapping is intentionally expressed as a preference delta: every point of
+     * score difference moves 10 percentage points from the lower-scored path to the higher-scored
+     * path. Score 1 is the neutral baseline: equal scores remain 50/50, while 2-vs-1 is 60/40.
      */
     @Synchronized
     fun configureUserScores(wifiScore: Int, cellularScore: Int) {
@@ -51,32 +63,51 @@ object DynamicWeightCalculator {
         }
 
         if (wifiAvailable && !cellularAvailable) {
+            samples.clear()
             currentWeights = NetworkWeights(100, 0)
             return currentWeights
         }
 
         if (!wifiAvailable && cellularAvailable) {
+            samples.clear()
             currentWeights = NetworkWeights(0, 100)
             return currentWeights
         }
 
         val wifi = wifiLatency.coerceAtLeast(1)
         val cellular = cellularLatency.coerceAtLeast(1)
+
+        if (samples.size == WINDOW_SIZE) samples.removeFirst()
+        samples.addLast(Sample(wifi, cellular))
+
         val preferred = preferredWeights()
 
-        // No rolling cache/window: the latest measurement is authoritative. A path
-        // must be at least 10% better before its share is moved away from the user's
-        // preferred/default split. Otherwise the configured preference is preserved.
-        val wifiBetter = wifi.toDouble() * ADVANTAGE_RATIO < cellular.toDouble()
-        val cellularBetter = cellular.toDouble() * ADVANTAGE_RATIO < wifi.toDouble()
+        if (samples.size < MIN_SAMPLES_FOR_DECISION) {
+            currentWeights = preferred
+            return currentWeights
+        }
 
+        val wifiLatencies = samples.map { it.wifiLatencyMs }
+        val cellularLatencies = samples.map { it.cellularLatencyMs }
+        val wifiMedian = median(wifiLatencies)
+        val cellularMedian = median(cellularLatencies)
+
+        val wifiStability = medianAbsoluteDeviation(wifiLatencies, wifiMedian)
+        val cellularStability = medianAbsoluteDeviation(cellularLatencies, cellularMedian)
+        val wifiCost = wifiMedian + (wifiStability * 2L)
+        val cellularCost = cellularMedian + (cellularStability * 2L)
+
+        val wifiBetter = wifiCost.toDouble() * ADVANTAGE_RATIO < cellularCost.toDouble()
+        val cellularBetter = cellularCost.toDouble() * ADVANTAGE_RATIO < wifiCost.toDouble()
+
+        // No statistically meaningful winner: preserve the user's preferred/default split.
         if (!wifiBetter && !cellularBetter) {
             currentWeights = preferred
             return currentWeights
         }
 
-        val wifiQualityScore = 1.0 / wifi.toDouble()
-        val cellularQualityScore = 1.0 / cellular.toDouble()
+        val wifiQualityScore = 1.0 / wifiCost.toDouble()
+        val cellularQualityScore = 1.0 / cellularCost.toDouble()
         val total = wifiQualityScore + cellularQualityScore
         val rawWifi = ((wifiQualityScore / total) * 100.0).toInt()
 
@@ -90,16 +121,18 @@ object DynamicWeightCalculator {
         return currentWeights
     }
 
-    /** Clears session quality state and restores the user's preferred/default split. */
+    /** Clears only session quality history; the persistent user scores remain intact. */
     @Synchronized
     fun resetForPathRecovery(): NetworkWeights {
+        samples.clear()
         currentWeights = preferredWeights()
         return currentWeights
     }
 
-    /** Clears all session quality state on a complete BigRocket disconnect. */
+    /** Clears all session cache state on a complete BigRocket disconnect. */
     @Synchronized
     fun clear() {
+        samples.clear()
         currentWeights = preferredWeights()
     }
 
@@ -109,5 +142,16 @@ object DynamicWeightCalculator {
         val delta = ((cellularUserScore - wifiUserScore) * 10).coerceIn(-40, 40)
         val cellular = (50 + delta).coerceIn(10, 90)
         return NetworkWeights(100 - cellular, cellular)
+    }
+
+    private fun median(values: List<Long>): Long {
+        if (values.isEmpty()) return 1L
+        val sorted = values.sorted()
+        return sorted[sorted.size / 2]
+    }
+
+    private fun medianAbsoluteDeviation(values: List<Long>, median: Long): Long {
+        if (values.isEmpty()) return 0L
+        return median(values.map { abs(it - median) })
     }
 }

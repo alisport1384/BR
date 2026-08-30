@@ -53,6 +53,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // parallel, so the realistic worst case is one probe's own ~1.5s timeout; this is a
         // hard ceiling so a pathological case can never delay startup past what's acceptable.
         private const val INITIAL_ASSESSMENT_TIMEOUT_MS = 3000L
+        // A single missed latency probe is a transient keep-alive failure, not a lost path.
+        private const val PROBE_FAILURES_TO_DECLARE_LOST = 3
+        private const val PROBE_SUCCESSES_TO_DECLARE_RECOVERED = 2
         // hev-socks5-tunnel's OWN internal netif MTU (see HevConfig) - independent of the
         // real VpnService.Builder MTU (1400, set in setupVpn()) that the actual TUN device
         // uses; kept equal to it so hev doesn't fragment/reassemble against a mismatched
@@ -83,6 +86,12 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     // evict pinned sessions immediately - see TunPacketRouter.notifySoftFailure.
     @Volatile private var lastWifiOk = true
     @Volatile private var lastCellularOk = true
+    @Volatile private var wifiProbeFailures = 0
+    @Volatile private var cellularProbeFailures = 0
+    @Volatile private var wifiProbeSuccesses = 0
+    @Volatile private var cellularProbeSuccesses = 0
+    @Volatile private var lastGoodWifiLatencyMs = 80L
+    @Volatile private var lastGoodCellularLatencyMs = 80L
     // Which packet engine currently owns the TUN fd: the existing JVM router
     // (TunPacketRouter, handles both direct/NONE bonding and JVM-relayed AETHER
     // upstream), or the native hev-socks5-tunnel bridge (studio.cluvex.aether.core.
@@ -340,6 +349,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         wifiNetwork = wifi
         cellularNetwork = cellular
 
+        if (wifi == null) { wifiProbeFailures = 0; wifiProbeSuccesses = 0 }
+        if (cellular == null) { cellularProbeFailures = 0; cellularProbeSuccesses = 0 }
+
         packetRouter?.updateNetworks(wifi, cellular)
 
         val bothAvailable = wifi != null && cellular != null
@@ -417,29 +429,76 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 // which naturally lowers (but doesn't zero out) that path's share. Previously a
                 // hard 900ms cutoff treated "slow" the same as "gone", causing an abrupt full
                 // cutover to the other path even though the "lost" one was still usable.
-                val wifiOk = wifi != null && wifiLatency != LatencyTester.FAILURE
-                val cellularOk = cellular != null && cellularLatency != LatencyTester.FAILURE
+                // A latency probe is a keep-alive signal, not an authoritative Android network
+                // disconnect event. Mobile radios, Wi-Fi power-save and transient upstream loss
+                // can make one 1.5s probe miss even though the Network is still usable. Treating
+                // that single miss as "disconnected" causes the exact UI flap: disconnected ->
+                // immediately connected on the next successful probe. Use hysteresis: several
+                // consecutive failures are required to declare a path lost, and several successes
+                // are required to declare a previously lost path recovered.
+                if (wifi == null) {
+                    wifiProbeFailures = 0
+                    wifiProbeSuccesses = 0
+                    lastGoodWifiLatencyMs = 80L
+                    lastWifiOk = false
+                } else if (wifiLatency == LatencyTester.FAILURE) {
+                    wifiProbeSuccesses = 0
+                    wifiProbeFailures = (wifiProbeFailures + 1).coerceAtMost(PROBE_FAILURES_TO_DECLARE_LOST)
+                } else {
+                    wifiProbeFailures = 0
+                    wifiProbeSuccesses = (wifiProbeSuccesses + 1).coerceAtMost(PROBE_SUCCESSES_TO_DECLARE_RECOVERED)
+                    lastGoodWifiLatencyMs = wifiLatency.coerceAtLeast(1)
+                }
 
-                // Soft failure: the path is formally still "available" (no onLost from
-                // Android, so updateNetworks()/notifyNetworkLost never fired) but the
-                // probe just went from succeeding to timing out on it - a bad AP,
-                // upstream/carrier outage, or captive portal rather than the radio
-                // actually going away. Sessions already pinned to it would otherwise
-                // just silently die and sit there until their own 60s idle timeout;
-                // evict them onto the surviving path immediately instead, the same way
-                // a real onLost already does.
-                if (lastWifiOk && !wifiOk && wifi != null) {
+                if (cellular == null) {
+                    cellularProbeFailures = 0
+                    cellularProbeSuccesses = 0
+                    lastGoodCellularLatencyMs = 80L
+                    lastCellularOk = false
+                } else if (cellularLatency == LatencyTester.FAILURE) {
+                    cellularProbeSuccesses = 0
+                    cellularProbeFailures = (cellularProbeFailures + 1).coerceAtMost(PROBE_FAILURES_TO_DECLARE_LOST)
+                } else {
+                    cellularProbeFailures = 0
+                    cellularProbeSuccesses = (cellularProbeSuccesses + 1).coerceAtMost(PROBE_SUCCESSES_TO_DECLARE_RECOVERED)
+                    lastGoodCellularLatencyMs = cellularLatency.coerceAtLeast(1)
+                }
+
+                val previousWifiOk = lastWifiOk
+                val previousCellularOk = lastCellularOk
+                val wifiOk = when {
+                    wifi == null -> false
+                    wifiProbeFailures >= PROBE_FAILURES_TO_DECLARE_LOST -> false
+                    previousWifiOk -> true
+                    wifiProbeSuccesses >= PROBE_SUCCESSES_TO_DECLARE_RECOVERED -> true
+                    else -> false
+                }
+                val cellularOk = when {
+                    cellular == null -> false
+                    cellularProbeFailures >= PROBE_FAILURES_TO_DECLARE_LOST -> false
+                    previousCellularOk -> true
+                    cellularProbeSuccesses >= PROBE_SUCCESSES_TO_DECLARE_RECOVERED -> true
+                    else -> false
+                }
+
+                // Only evict pinned sessions after the keep-alive hysteresis confirms a real
+                // soft failure. A single missed probe never moves sessions or changes UI state.
+                if (previousWifiOk && !wifiOk && wifi != null) {
                     cellular?.let { packetRouter?.notifySoftFailure(wifi, it) }
                 }
-                if (lastCellularOk && !cellularOk && cellular != null) {
+                if (previousCellularOk && !cellularOk && cellular != null) {
                     wifi?.let { packetRouter?.notifySoftFailure(cellular, it) }
                 }
+
                 val pathRecoveredAfterProbe =
-                    (!lastWifiOk && wifiOk) ||
-                        (!lastCellularOk && cellularOk)
+                    (!previousWifiOk && wifiOk) ||
+                        (!previousCellularOk && cellularOk)
 
                 lastWifiOk = wifiOk
                 lastCellularOk = cellularOk
+
+                val effectiveWifiLatency = if (wifiLatency == LatencyTester.FAILURE) lastGoodWifiLatencyMs else wifiLatency
+                val effectiveCellularLatency = if (cellularLatency == LatencyTester.FAILURE) lastGoodCellularLatencyMs else cellularLatency
 
                 if (pathRecoveredAfterProbe && wifiOk && cellularOk) {
                     val reset = DynamicWeightCalculator.resetForPathRecovery()
@@ -448,9 +507,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
                 val weights = DynamicWeightCalculator.update(
                     wifiAvailable = wifiOk,
-                    wifiLatency = wifiLatency.coerceAtLeast(1),
+                    wifiLatency = effectiveWifiLatency.coerceAtLeast(1),
                     cellularAvailable = cellularOk,
-                    cellularLatency = cellularLatency.coerceAtLeast(1)
+                    cellularLatency = effectiveCellularLatency.coerceAtLeast(1)
                 )
 
                 packetRouter?.updateWeights(weights.wifiWeight, weights.cellularWeight)
