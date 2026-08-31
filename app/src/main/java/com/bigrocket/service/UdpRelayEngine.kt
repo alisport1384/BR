@@ -104,6 +104,7 @@ class UdpRelayEngine(
                     val destAddr = InetAddress.getByName(packet.destinationIp)
                     val outPacket = DatagramPacket(payload, payloadSize, destAddr, packet.destinationPort)
                     session.socket.send(outPacket)
+                    PathActivityMonitor.recordActivity(session.network)
                 }
                 TrafficStats.recordBytes(payloadSize)
             }
@@ -126,6 +127,7 @@ class UdpRelayEngine(
                 } else {
                     val rxPacket = DatagramPacket(rxBuffer, rxBuffer.size)
                     socket.receive(rxPacket)
+                    PathActivityMonitor.recordActivity(session.network)
                     rxPacket.data.copyOf(rxPacket.length)
                 }
                 if (payload == null) {

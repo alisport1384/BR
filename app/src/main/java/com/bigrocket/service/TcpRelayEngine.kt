@@ -264,6 +264,7 @@ class TcpRelayEngine(
             }
             session.clientNextSeq = packet.tcpSeq + payload.size
             TrafficStats.recordBytes(payload.size)
+            if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
             // Acknowledge the data immediately so the client's TCP stack doesn't stall/retransmit.
             sendAck(key, session, tunOutputStream)
         } catch (_: Exception) {
@@ -384,6 +385,7 @@ class TcpRelayEngine(
 
             session.serverSeq += chunkSize
             TrafficStats.recordBytes(chunkSize)
+            if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
             session.lastActivityMs = System.currentTimeMillis()
             offset += chunkSize
         }
