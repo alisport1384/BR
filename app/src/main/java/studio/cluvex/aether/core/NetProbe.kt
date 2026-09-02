@@ -3,6 +3,7 @@ package studio.cluvex.aether.core
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.IOException
+import android.net.Network
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -91,6 +92,34 @@ object NetProbe {
     }
 
     /**
+     * Public IP lookup forced through a specific physical Android Network.
+     * This is used by BigRocket's identity policy so the displayed operator IP
+     * comes from the path selected by user score/stability, not Android's default
+     * network (which is commonly Wi-Fi).
+     */
+    fun fetchIpInfoDirectViaNetwork(
+        network: Network,
+        timeoutMs: Int = 8000,
+    ): IpInfo? {
+        for (p in GEO_PROVIDERS) {
+            val info = runCatching {
+                openDirectIpv4(network, p.host, p.port, timeoutMs).use { s ->
+                    val io = if (p.tls) tlsWrap(s, p.host, p.port, timeoutMs) else s
+                    parseIpInfo(httpGet(io, p.host, p.path))
+                }
+            }.onFailure {
+                DiagnosticsLog.d("netprobe", "network geo ${p.host} failed: ${it.message}")
+            }.getOrNull()
+            if (info != null) {
+                return refineCountry(info, p) { host, port ->
+                    openDirectIpv4(network, host, port, timeoutMs)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
      * Opens a DIRECT (non-proxied) socket, forcing IPv4.
      *
      * ROOT-CAUSE FIX (MCI / Hamrah-e-Aval cellular): on dual-stack mobile data
@@ -103,6 +132,20 @@ object NetProbe {
     private fun openDirectIpv4(host: String, port: Int, timeoutMs: Int): Socket {
         val addr = resolveIpv4(host)
         return Socket().apply {
+            connect(InetSocketAddress(addr, port), timeoutMs)
+            soTimeout = timeoutMs
+        }
+    }
+
+    /** Opens an IPv4 socket explicitly on [network], never on Android's default network. */
+    private fun openDirectIpv4(
+        network: Network,
+        host: String,
+        port: Int,
+        timeoutMs: Int,
+    ): Socket {
+        val addr = resolveIpv4(host)
+        return network.socketFactory.createSocket().apply {
             connect(InetSocketAddress(addr, port), timeoutMs)
             soTimeout = timeoutMs
         }
