@@ -30,7 +30,18 @@ class TunPacketRouter(
 
     @Volatile private var wifiWeight = 50
     @Volatile private var cellularWeight = 50
-    private val packetCounter = AtomicInteger(0)
+    // Randomized starting phase, not 0: getOrAssignNetwork calls selectNetworkForPacket()
+    // exactly ONCE per new flow (see NetworkSessionTracker), not per packet, so this counter
+    // advances once per new connection. Starting it at a fixed 0 meant "count < wifiWeight"
+    // was true for the very FIRST wifiWeight new connections of every single VPN session,
+    // deterministically - e.g. with wifiWeight=20, the first 20 new connections after every
+    // fresh connect always landed on Wi-Fi no matter how low its share was set, before
+    // Cellular was ever chosen even once. A single download is exactly one new connection, so
+    // it was guaranteed to run entirely over Wi-Fi's speed regardless of the configured split.
+    // A random starting phase makes each fresh session's very first pick a genuine
+    // wifiWeight/100 draw instead of a guaranteed hit, while still preserving round robin's
+    // accurate long-run proportions once many connections have been opened.
+    private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
 
     private val sessionTracker = NetworkSessionTracker()
     private val udpRelayEngine = UdpRelayEngine(vpnService)
