@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.FileOutputStream
@@ -18,6 +19,16 @@ import kotlin.random.Random
 // Max app-data bytes per synthetic TCP segment we emit, sized to stay under the VPN
 // interface's declared MTU (1400) including the 20-byte IP + 20-byte TCP headers.
 private const val MAX_TCP_SEGMENT_PAYLOAD = 1360
+
+// Bound on how many not-yet-written upload chunks can queue up per session before the
+// consumer (runSocketWriter) is treated as stuck - see the comment on TcpSession.writeChannel
+// for why this exists at all.
+private const val TCP_WRITE_QUEUE_CAPACITY = 64
+
+// One pending upload chunk plus the client-sequence value it advances to once actually
+// written - carried through the channel so ordering/seq-accounting stays correct even though
+// the real write now happens on a different coroutine than the one that received the packet.
+private data class PendingWrite(val payload: ByteArray, val clientNextSeqAfter: Long)
 
 // Fallback window to assume before the client has told us its real one, and the cap on how
 // long we'll wait for the client's window to open before giving up on a stalled peer.
@@ -54,7 +65,17 @@ private class TcpSession(
     @Volatile var clientAckedSeq: Long,
     // Client's last advertised TCP receive window, in bytes.
     @Volatile var clientWindow: Int,
-    @Volatile var lastActivityMs: Long = System.currentTimeMillis()
+    @Volatile var lastActivityMs: Long = System.currentTimeMillis(),
+    // Upload-direction (client -> remote) bytes are hand off here instead of being written to
+    // the socket directly on the caller's thread. forwardTcpPacket/forwardDataToSocket run on
+    // TunPacketRouter's single TUN-read coroutine, shared by every session on every physical
+    // path. Socket.getOutputStream().write() can legitimately block for seconds when the
+    // underlying path is failing (send buffer full, no ACKs getting through, e.g. Wi-Fi about
+    // to drop) - a blocking write there would stall that one shared coroutine, freezing packet
+    // processing for every other session on every path (including the still-healthy one) until
+    // it times out. Queuing here and doing the real write on this session's own coroutine
+    // (runSocketWriter) confines that risk to one session's own thread.
+    val writeChannel: Channel<PendingWrite> = Channel(TCP_WRITE_QUEUE_CAPACITY)
 )
 
 /**
@@ -88,6 +109,7 @@ class TcpRelayEngine(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val sessions = ConcurrentHashMap<SessionKey, TcpSession>()
     private val socketJobs = ConcurrentHashMap<SessionKey, Job>()
+    private val writerJobs = ConcurrentHashMap<SessionKey, Job>()
     private var reaperJob: Job? = null
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
@@ -112,6 +134,8 @@ class TcpRelayEngine(
         sessions.clear()
         socketJobs.values.forEach { it.cancel() }
         socketJobs.clear()
+        writerJobs.values.forEach { it.cancel() }
+        writerJobs.clear()
     }
 
     fun forwardTcpPacket(
@@ -225,6 +249,7 @@ class TcpRelayEngine(
 
                 val job = launch { listenForTcpResponses(key, session, tunOutputStream) }
                 socketJobs[key] = job
+                writerJobs[key] = launch { runSocketWriter(key, session, tunOutputStream) }
             } catch (_: Exception) {
                 try {
                     val rst = IpPacketBuilder.buildTcpResponsePacket(
@@ -257,17 +282,42 @@ class TcpRelayEngine(
         packet: ParsedIpPacket,
         tunOutputStream: FileOutputStream
     ) {
+        // Must not call session.socket's blocking write() here: this function runs on
+        // TunPacketRouter's single shared TUN-read coroutine (see the comment on
+        // TcpSession.writeChannel). Handing the payload to the queue and returning
+        // immediately is what keeps one struggling path from freezing every other flow.
+        val pending = PendingWrite(payload, packet.tcpSeq + payload.size)
+        val result = session.writeChannel.trySend(pending)
+        if (result.isFailure) {
+            // Queue is full, meaning runSocketWriter's actual write() has been stuck for
+            // TCP_WRITE_QUEUE_CAPACITY chunks already - treat that exactly like a hard write
+            // failure (below) rather than blocking here waiting for room to free up.
+            closeSession(key)
+        }
+    }
+
+    /**
+     * Drains one session's upload queue and performs the real (possibly blocking) socket
+     * write on this session's own coroutine, off TunPacketRouter's shared TUN-read thread -
+     * see the comment on TcpSession.writeChannel for why this split exists. Sequence
+     * accounting and the client ACK are only advanced/sent once a chunk is actually written,
+     * preserving the original synchronous behavior's semantics.
+     */
+    private suspend fun runSocketWriter(key: SessionKey, session: TcpSession, tunOutputStream: FileOutputStream) {
         try {
-            session.socket.getOutputStream().apply {
-                write(payload)
-                flush()
+            val outStream = session.socket.getOutputStream()
+            for (pending in session.writeChannel) {
+                outStream.write(pending.payload)
+                outStream.flush()
+                session.clientNextSeq = pending.clientNextSeqAfter
+                session.lastActivityMs = System.currentTimeMillis()
+                TrafficStats.recordBytes(pending.payload.size)
+                if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
+                sendAck(key, session, tunOutputStream)
             }
-            session.clientNextSeq = packet.tcpSeq + payload.size
-            TrafficStats.recordBytes(payload.size)
-            if (upstreamMode == UpstreamMode.NONE) PathActivityMonitor.recordActivity(session.network)
-            // Acknowledge the data immediately so the client's TCP stack doesn't stall/retransmit.
-            sendAck(key, session, tunOutputStream)
         } catch (_: Exception) {
+            // Real write failure (socket dead/reset) - tear the session down like before.
+        } finally {
             closeSession(key)
         }
     }
@@ -394,7 +444,9 @@ class TcpRelayEngine(
 
     private fun closeSession(key: SessionKey) {
         socketJobs.remove(key)?.cancel()
+        writerJobs.remove(key)?.cancel()
         sessions.remove(key)?.let {
+            it.writeChannel.close()
             try { it.socket.close() } catch (_: Exception) {}
         }
     }
@@ -472,7 +524,10 @@ class TcpRelayEngine(
         reaperJob?.cancel()
         socketJobs.values.forEach { it.cancel() }
         socketJobs.clear()
+        writerJobs.values.forEach { it.cancel() }
+        writerJobs.clear()
         sessions.values.forEach { session ->
+            session.writeChannel.close()
             try { session.socket.close() } catch (_: Exception) {}
         }
         sessions.clear()
