@@ -1,6 +1,7 @@
 package com.bigrocket.service
 
 import kotlin.math.abs
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Calculates routing shares from persistent user preference and observed path quality.
@@ -26,6 +27,7 @@ object DynamicWeightCalculator {
     )
 
     private val samples = ArrayDeque<Sample>(WINDOW_SIZE)
+    private val weightListeners = CopyOnWriteArrayList<(NetworkWeights) -> Unit>()
 
     @Volatile private var wifiUserScore = 1
     @Volatile private var cellularUserScore = 1
@@ -42,6 +44,7 @@ object DynamicWeightCalculator {
         recoveringPath = null
         samples.clear()
         currentWeights = preferredWeights()
+        publishWeights(currentWeights)
     }
 
     fun wifiScore(): Int = wifiUserScore
@@ -159,6 +162,7 @@ object DynamicWeightCalculator {
         recoveringPath = if (recoveredWifi) Path.WIFI else Path.CELLULAR
         recoveryWeight = RECOVERY_START_WEIGHT
         currentWeights = recoveryWeights(recoveringPath!!)
+        publishWeights(currentWeights)
         return currentWeights
     }
 
@@ -168,9 +172,23 @@ object DynamicWeightCalculator {
         recoveringPath = null
         recoveryWeight = RECOVERY_START_WEIGHT
         currentWeights = preferredWeights()
+        publishWeights(currentWeights)
     }
 
     fun currentWeights(): NetworkWeights = currentWeights
+
+    /** Registers a listener for routing-weight changes. Returns an unregister action. */
+    fun addWeightsListener(listener: (NetworkWeights) -> Unit): () -> Unit {
+        weightListeners.add(listener)
+        listener(currentWeights)
+        return { weightListeners.remove(listener) }
+    }
+
+    private fun publishWeights(weights: NetworkWeights) {
+        weightListeners.forEach { listener ->
+            runCatching { listener(weights) }
+        }
+    }
 
     private fun recoveryWeights(path: Path): NetworkWeights = when (path) {
         Path.WIFI -> NetworkWeights(RECOVERY_START_WEIGHT, 100 - RECOVERY_START_WEIGHT)
