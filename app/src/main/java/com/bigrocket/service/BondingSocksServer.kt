@@ -53,13 +53,11 @@ class BondingSocksServer(private val vpnService: VpnService) {
     @Volatile private var cellularWeight = 50
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
-    private var wifiCurrentWeight = 0
-    private var cellularCurrentWeight = 0
-    private val selectionLock = Any()
-    private var removeWeightsListener: (() -> Unit)? = null
+    private val packetCounter = AtomicInteger(0)
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
+    private var removeWeightsListener: (() -> Unit)? = null
     private var acceptJob: Job? = null
 
     /** Every open relay (TCP or UDP), tagged with which physical Network it's using, so a
@@ -102,24 +100,11 @@ class BondingSocksServer(private val vpnService: VpnService) {
     fun updateNetworks(wifi: Network?, cellular: Network?) {
         wifiNetwork = wifi
         cellularNetwork = cellular
-        synchronized(selectionLock) {
-            wifiCurrentWeight = 0
-            cellularCurrentWeight = 0
-        }
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
-        synchronized(selectionLock) {
-            val newWifi = wifiW.coerceAtLeast(0)
-            val newCellular = cellularW.coerceAtLeast(0)
-            val changed = wifiWeight != newWifi || cellularWeight != newCellular
-            wifiWeight = newWifi
-            cellularWeight = newCellular
-            if (changed) {
-                wifiCurrentWeight = 0
-                cellularCurrentWeight = 0
-            }
-        }
+        wifiWeight = wifiW
+        cellularWeight = cellularW
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -142,16 +127,9 @@ class BondingSocksServer(private val vpnService: VpnService) {
         val wifi = wifiNetwork
         val cellular = cellularNetwork
         if (wifi != null && cellular != null) {
-            synchronized(selectionLock) {
-                wifiCurrentWeight += wifiWeight
-                cellularCurrentWeight += cellularWeight
-                if (wifiCurrentWeight >= cellularCurrentWeight) {
-                    wifiCurrentWeight -= 100
-                    return wifi
-                }
-                cellularCurrentWeight -= 100
-                return cellular
-            }
+            val count = packetCounter.getAndIncrement() % 100
+            val abs = if (count < 0) count + 100 else count
+            return if (abs < wifiWeight) wifi else cellular
         }
         return wifi ?: cellular
     }
