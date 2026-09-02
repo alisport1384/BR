@@ -57,7 +57,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
-    private var removeWeightsListener: (() -> Unit)? = null
     private var acceptJob: Job? = null
 
     /** Every open relay (TCP or UDP), tagged with which physical Network it's using, so a
@@ -69,9 +68,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
 
     fun start() {
         if (serverSocket != null) return
-        removeWeightsListener = DynamicWeightCalculator.addWeightsListener { weights ->
-            updateWeights(weights.wifiWeight, weights.cellularWeight)
-        }
         val server = ServerSocket(PORT, 128, InetAddress.getByName("127.0.0.1"))
         serverSocket = server
         acceptJob = scope.launch {
@@ -89,8 +85,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
     fun stop() {
         acceptJob?.cancel()
         acceptJob = null
-        removeWeightsListener?.invoke()
-        removeWeightsListener = null
         runCatching { serverSocket?.close() }
         serverSocket = null
         activeRelays.values.toList().forEach { runCatching { it.close() } }
