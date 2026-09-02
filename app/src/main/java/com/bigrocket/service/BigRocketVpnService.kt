@@ -336,8 +336,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             isRunning = true
 
             packetRouter = TunPacketRouter(establishedInterface, this).also {
-                val initial = DynamicWeightCalculator.currentWeights()
-                it.updateWeights(initial.wifiWeight, initial.cellularWeight)
+                it.updateWeights(50, 50)
                 it.start()
             }
 
@@ -393,7 +392,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 ).also { packetRouter?.updateWeights(it.wifiWeight, it.cellularWeight) }
             }
             pathRecovered -> {
-                val reset = DynamicWeightCalculator.resetForPathRecovery(recoveredWifi = wifi != null && oldWifi == null)
+                val reset = DynamicWeightCalculator.resetForPathRecovery(
+                    recoveredWifi = oldWifi == null || (wifi != null && oldWifi != wifi)
+                )
                 packetRouter?.updateWeights(reset.wifiWeight, reset.cellularWeight)
             }
         }
@@ -494,7 +495,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 val effectiveCellularLatency = if (cellularLatency == LatencyTester.FAILURE) cellularHealth.lastGoodLatencyMs else cellularLatency
 
                 if (pathRecoveredAfterProbe && wifiOk && cellularOk) {
-                    val reset = DynamicWeightCalculator.resetForPathRecovery(recoveredWifi = !previousWifiOk && wifiOk)
+                    val reset = DynamicWeightCalculator.resetForPathRecovery(
+                        recoveredWifi = (!previousWifiOk && wifiOk)
+                    )
                     packetRouter?.updateWeights(reset.wifiWeight, reset.cellularWeight)
                 }
 
