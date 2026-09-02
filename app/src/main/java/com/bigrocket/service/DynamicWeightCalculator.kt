@@ -18,6 +18,8 @@ object DynamicWeightCalculator {
     private const val MIN_WEIGHT = 10
     private const val RECOVERY_START_WEIGHT = 10
     private const val RECOVERY_STEP = 10
+    private const val UNSTABLE_RECONNECT_LIMIT = 2
+    private const val RECONNECT_WINDOW_MS = 60_000L
 
     private enum class Path { WIFI, CELLULAR }
 
@@ -34,6 +36,10 @@ object DynamicWeightCalculator {
     @Volatile private var currentWeights = NetworkWeights(50, 50)
     @Volatile private var recoveringPath: Path? = null
     @Volatile private var recoveryWeight = RECOVERY_START_WEIGHT
+
+    // Identity/IP eligibility is deliberately independent from routing share.
+    private val wifiReconnects = ArrayDeque<Long>()
+    private val cellularReconnects = ArrayDeque<Long>()
 
     @Synchronized
     fun configureUserScores(wifiScore: Int, cellularScore: Int) {
@@ -55,6 +61,46 @@ object DynamicWeightCalculator {
         wifiUserScore > cellularUserScore -> "wifi"
         cellularUserScore > wifiUserScore -> "cellular"
         else -> null
+    }
+
+    /**
+     * Returns the path that is allowed to determine the externally visible IP/identity.
+     * This is intentionally independent from routing weights.
+     *
+     * Unequal user scores are authoritative: the higher-scored path owns identity.
+     * With equal scores, a path that has reconnected twice within the last minute is
+     * temporarily barred from owning identity; the other available path wins.
+     */
+    @Synchronized
+    fun preferredIdentityPath(wifiAvailable: Boolean, cellularAvailable: Boolean): String? {
+        if (!wifiAvailable && !cellularAvailable) return null
+        if (wifiAvailable && !cellularAvailable) return "wifi"
+        if (!wifiAvailable && cellularAvailable) return "cellular"
+
+        if (wifiUserScore > cellularUserScore) return "wifi"
+        if (cellularUserScore > wifiUserScore) return "cellular"
+
+        val wifiUnstable = reconnectCount(Path.WIFI) >= UNSTABLE_RECONNECT_LIMIT
+        val cellularUnstable = reconnectCount(Path.CELLULAR) >= UNSTABLE_RECONNECT_LIMIT
+        return when {
+            wifiUnstable && !cellularUnstable -> "cellular"
+            cellularUnstable && !wifiUnstable -> "wifi"
+            else -> null
+        }
+    }
+
+    fun isIdentityEligible(path: String): Boolean = synchronized(this) {
+        if (wifiUserScore != cellularUserScore) {
+            return@synchronized preferredPath() == path
+        }
+        reconnectCount(if (path.equals("wifi", true)) Path.WIFI else Path.CELLULAR) < UNSTABLE_RECONNECT_LIMIT
+    }
+
+    private fun reconnectCount(path: Path): Int {
+        val now = System.currentTimeMillis()
+        val queue = if (path == Path.WIFI) wifiReconnects else cellularReconnects
+        while (queue.isNotEmpty() && now - queue.first() >= RECONNECT_WINDOW_MS) queue.removeFirst()
+        return queue.size
     }
 
     @Synchronized
@@ -85,6 +131,14 @@ object DynamicWeightCalculator {
         val cellular = cellularLatency.coerceAtLeast(1)
         if (samples.size == WINDOW_SIZE) samples.removeFirst()
         samples.addLast(Sample(wifi, cellular))
+
+        // User scoring is always authoritative for share allocation. Recovery at 10% is
+        // only a rule for equal user scores; it must never override an explicit preference.
+        if (wifiUserScore != cellularUserScore) {
+            recoveringPath = null
+            currentWeights = preferredWeights()
+            return currentWeights
+        }
 
         // While a path is being reintroduced, never let the normal preferred split immediately
         // jump it back to 50% (or 90%). It starts at 10% and only earns more after evidence.
@@ -158,6 +212,7 @@ object DynamicWeightCalculator {
     /** Reintroduces exactly one recovered path at 10%; the survivor owns the remaining 90%. */
     @Synchronized
     fun resetForPathRecovery(recoveredWifi: Boolean): NetworkWeights {
+        recordReconnect(if (recoveredWifi) Path.WIFI else Path.CELLULAR)
         samples.clear()
         recoveringPath = if (recoveredWifi) Path.WIFI else Path.CELLULAR
         recoveryWeight = RECOVERY_START_WEIGHT
@@ -188,6 +243,13 @@ object DynamicWeightCalculator {
         weightListeners.forEach { listener ->
             runCatching { listener(weights) }
         }
+    }
+
+    private fun recordReconnect(path: Path) {
+        val now = System.currentTimeMillis()
+        val queue = if (path == Path.WIFI) wifiReconnects else cellularReconnects
+        queue.addLast(now)
+        while (queue.isNotEmpty() && now - queue.first() >= RECONNECT_WINDOW_MS) queue.removeFirst()
     }
 
     private fun recoveryWeights(path: Path): NetworkWeights = when (path) {
