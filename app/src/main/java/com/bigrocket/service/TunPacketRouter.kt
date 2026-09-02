@@ -10,6 +10,7 @@ import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 
 class TunPacketRouter(
     private val vpnInterface: ParcelFileDescriptor,
@@ -29,24 +30,22 @@ class TunPacketRouter(
 
     @Volatile private var wifiWeight = 50
     @Volatile private var cellularWeight = 50
-
-    // Smooth weighted round-robin state. Unlike the old modulo counter this starts a new
-    // preference immediately on the first connection and never gives the lower-priority path
-    // an artificial "first N connections" advantage after a weight change.
-    private var wifiCurrentWeight = 0
-    private var cellularCurrentWeight = 0
-    private val selectionLock = Any()
-    private var removeWeightsListener: (() -> Unit)? = null
+    // Randomized starting phase, not 0: getOrAssignNetwork calls selectNetworkForPacket()
+    // exactly ONCE per new flow (see NetworkSessionTracker), not per packet, so this counter
+    // advances once per new connection. Starting it at a fixed 0 meant "count < wifiWeight"
+    // was true for the very FIRST wifiWeight new connections of every single VPN session,
+    // deterministically - e.g. with wifiWeight=20, the first 20 new connections after every
+    // fresh connect always landed on Wi-Fi no matter how low its share was set, before
+    // Cellular was ever chosen even once. A single download is exactly one new connection, so
+    // it was guaranteed to run entirely over Wi-Fi's speed regardless of the configured split.
+    // A random starting phase makes each fresh session's very first pick a genuine
+    // wifiWeight/100 draw instead of a guaranteed hit, while still preserving round robin's
+    // accurate long-run proportions once many connections have been opened.
+    private val packetCounter = AtomicInteger(0)
 
     private val sessionTracker = NetworkSessionTracker()
     private val udpRelayEngine = UdpRelayEngine(vpnService)
     private val tcpRelayEngine = TcpRelayEngine(vpnService)
-
-    init {
-        removeWeightsListener = DynamicWeightCalculator.addWeightsListener { weights ->
-            updateWeights(weights.wifiWeight, weights.cellularWeight)
-        }
-    }
 
     @Volatile private var tunOutputStream: FileOutputStream? = null
 
@@ -56,13 +55,6 @@ class TunPacketRouter(
 
         this.wifiNetwork = wifi
         this.cellularNetwork = cellular
-
-        if (oldWifi != wifi || oldCellular != cellular) {
-            synchronized(selectionLock) {
-                wifiCurrentWeight = 0
-                cellularCurrentWeight = 0
-            }
-        }
 
         if (oldWifi != null && wifi == null) {
             notifyNetworkLost(oldWifi)
@@ -110,20 +102,10 @@ class TunPacketRouter(
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
-        val newWifi = wifiW.coerceAtLeast(0)
-        val newCellular = cellularW.coerceAtLeast(0)
-        synchronized(selectionLock) {
-            val changed = this.wifiWeight != newWifi || this.cellularWeight != newCellular
-            this.wifiWeight = newWifi
-            this.cellularWeight = newCellular
-            // Rebase only on an actual preference/topology weight change. The health loop
-            // republishes the same user weights every cycle; resetting on every publication
-            // would make every new flow choose the same path forever.
-            if (changed) {
-                wifiCurrentWeight = 0
-                cellularCurrentWeight = 0
-            }
-        }
+        val changed = this.wifiWeight != wifiW || this.cellularWeight != cellularW
+        this.wifiWeight = wifiW
+        this.cellularWeight = cellularW
+        if (changed) packetCounter.set(0)
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -201,19 +183,20 @@ class TunPacketRouter(
         val cellular = cellularNetwork
 
         if (wifi != null && cellular != null) {
-            synchronized(selectionLock) {
-                wifiCurrentWeight += wifiWeight
-                cellularCurrentWeight += cellularWeight
-
-                val chooseWifi = wifiCurrentWeight >= cellularCurrentWeight
-                if (chooseWifi) {
-                    wifiCurrentWeight -= 100
-                    return wifi
+            val count = packetCounter.getAndIncrement()
+            // The first flow after a weight change is always placed on the user-preferred
+            // path. This is important for control/metadata connections (including IP checks):
+            // a 90/10 preference must not randomly start on the 10% path. Subsequent flows use
+            // the configured weighted distribution.
+            if (count == 0) {
+                return when {
+                    wifiWeight > cellularWeight -> wifi
+                    cellularWeight > wifiWeight -> cellular
+                    else -> wifi
                 }
-
-                cellularCurrentWeight -= 100
-                return cellular
             }
+            val slot = Math.floorMod(count, 100)
+            return if (slot < wifiWeight) wifi else cellular
         }
 
         return wifi ?: cellular
@@ -226,7 +209,5 @@ class TunPacketRouter(
         tcpRelayEngine.clear()
         routerJob?.cancel()
         tunOutputStream = null
-        removeWeightsListener?.invoke()
-        removeWeightsListener = null
     }
 }
