@@ -322,6 +322,26 @@ object NetProbe {
         return null
     }
 
+    /** [fetchIpInfoDirectViaNetwork] with retries for a flaky operator network. */
+    fun fetchIpInfoDirectViaNetworkWithRetry(
+        network: Network,
+        attempts: Int = 6,
+        delayMs: Long = 2000,
+        timeoutMs: Int = 8000,
+    ): IpInfo? {
+        repeat(attempts) { i ->
+            fetchIpInfoDirectViaNetwork(network, timeoutMs)?.let { return it }
+            if (i < attempts - 1) {
+                try {
+                    Thread.sleep(delayMs)
+                } catch (_: InterruptedException) {
+                    return null
+                }
+            }
+        }
+        return null
+    }
+
     /** [fetchIpInfoViaSocks] with retries to cover the tunnel's cold start. */
     fun fetchIpInfoViaSocksWithRetry(
         socksHost: String,
