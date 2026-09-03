@@ -53,7 +53,12 @@ class BondingSocksServer(private val vpnService: VpnService) {
     @Volatile private var cellularWeight = 50
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
-    private val packetCounter = AtomicInteger(0)
+    // Randomized starting phase, not 0 - identical reasoning/fix to
+    // TunPacketRouter.packetCounter: starting at a fixed 0 made the very first new
+    // connection after every weight change/session start deterministically land on
+    // Wi-Fi whenever wifiWeight > 0, regardless of how low the configured share was
+    // (a single download is exactly one connection, so it always ran at Wi-Fi's speed).
+    private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
@@ -97,8 +102,10 @@ class BondingSocksServer(private val vpnService: VpnService) {
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
+        val changed = wifiWeight != wifiW || cellularWeight != cellularW
         wifiWeight = wifiW
         cellularWeight = cellularW
+        if (changed) packetCounter.set(0)
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -121,9 +128,21 @@ class BondingSocksServer(private val vpnService: VpnService) {
         val wifi = wifiNetwork
         val cellular = cellularNetwork
         if (wifi != null && cellular != null) {
-            val count = packetCounter.getAndIncrement() % 100
-            val abs = if (count < 0) count + 100 else count
-            return if (abs < wifiWeight) wifi else cellular
+            val count = packetCounter.getAndIncrement()
+            // The first connection after a weight change/session start always follows the
+            // identity policy (DynamicWeightCalculator.preferredIdentityPath) instead of the
+            // plain weighted split below. This is what makes "the IP" (whichever path this
+            // connection happens to use) match the user's score deterministically rather than
+            // being a probabilistic draw that could land on the minority-share path.
+            if (count == 0) {
+                return when (DynamicWeightCalculator.preferredIdentityPath(wifiAvailable = true, cellularAvailable = true)) {
+                    "wifi" -> wifi
+                    "cellular" -> cellular
+                    else -> wifi
+                }
+            }
+            val slot = Math.floorMod(count, 100)
+            return if (slot < wifiWeight) wifi else cellular
         }
         return wifi ?: cellular
     }
