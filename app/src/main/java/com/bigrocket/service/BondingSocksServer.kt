@@ -45,6 +45,9 @@ class BondingSocksServer(private val vpnService: VpnService) {
         private const val CONNECT_TIMEOUT_MS = 5000
         private const val UDP_IDLE_TIMEOUT_MS = 60_000L
         private const val UDP_RECEIVE_TIMEOUT_MS = 1000
+        // See TunPacketRouter.IDENTITY_WINDOW_MS for the reasoning - kept identical so both
+        // implementations of the same role behave the same way.
+        private const val IDENTITY_WINDOW_MS = 20_000L
     }
 
     @Volatile private var wifiNetwork: Network? = null
@@ -59,6 +62,13 @@ class BondingSocksServer(private val vpnService: VpnService) {
     // Wi-Fi whenever wifiWeight > 0, regardless of how low the configured share was
     // (a single download is exactly one connection, so it always ran at Wi-Fi's speed).
     private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
+
+    // See the identical field/reasoning on TunPacketRouter.identityWindowUntilMs: a
+    // single-connection "first flow" special case does not survive real usage - background
+    // chatter typically opens several connections before the user manually checks anything, so
+    // a time window (not a connection count) is what actually covers "check right after
+    // connecting".
+    @Volatile private var identityWindowUntilMs: Long = System.currentTimeMillis() + IDENTITY_WINDOW_MS
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
@@ -105,7 +115,10 @@ class BondingSocksServer(private val vpnService: VpnService) {
         val changed = wifiWeight != wifiW || cellularWeight != cellularW
         wifiWeight = wifiW
         cellularWeight = cellularW
-        if (changed) packetCounter.set(0)
+        if (changed) {
+            packetCounter.set(kotlin.random.Random.nextInt(100))
+            identityWindowUntilMs = System.currentTimeMillis() + IDENTITY_WINDOW_MS
+        }
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -128,19 +141,20 @@ class BondingSocksServer(private val vpnService: VpnService) {
         val wifi = wifiNetwork
         val cellular = cellularNetwork
         if (wifi != null && cellular != null) {
-            val count = packetCounter.getAndIncrement()
-            // The first connection after a weight change/session start always follows the
-            // identity policy (DynamicWeightCalculator.preferredIdentityPath) instead of the
-            // plain weighted split below. This is what makes "the IP" (whichever path this
-            // connection happens to use) match the user's score deterministically rather than
-            // being a probabilistic draw that could land on the minority-share path.
-            if (count == 0) {
+            // Every new connection within IDENTITY_WINDOW_MS of connecting/last weight change
+            // follows the identity policy (DynamicWeightCalculator.preferredIdentityPath)
+            // instead of the plain weighted split below. This is what makes "the IP"
+            // (whichever path this connection happens to use) match the user's score
+            // deterministically rather than being a probabilistic draw that could land on the
+            // minority-share path.
+            if (System.currentTimeMillis() < identityWindowUntilMs) {
                 return when (DynamicWeightCalculator.preferredIdentityPath(wifiAvailable = true, cellularAvailable = true)) {
                     "wifi" -> wifi
                     "cellular" -> cellular
                     else -> wifi
                 }
             }
+            val count = packetCounter.getAndIncrement()
             val slot = Math.floorMod(count, 100)
             return if (slot < wifiWeight) wifi else cellular
         }
