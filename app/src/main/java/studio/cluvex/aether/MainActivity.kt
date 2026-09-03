@@ -30,6 +30,7 @@ import studio.cluvex.aether.core.NetProbe
 import studio.cluvex.aether.core.TunnelConfig
 import com.bigrocket.service.DynamicWeightCalculator
 import com.bigrocket.service.NetworkMonitor
+import com.bigrocket.service.NetworkPreferenceStore
 import studio.cluvex.aether.data.OnboardingStore
 import studio.cluvex.aether.data.ProfileStore
 import studio.cluvex.aether.model.ConnectionProfile
@@ -199,6 +200,21 @@ class MainActivity : ComponentActivity() {
                                 // shown" (see its doc comment in DynamicWeightCalculator);
                                 // fetchIpInfoDirectViaNetwork forces the probe onto that
                                 // exact physical Network.
+                                //
+                                // DynamicWeightCalculator is a process-lifetime singleton whose
+                                // wifiUserScore/cellularUserScore only get set inside
+                                // setupVpn(). Before the very first Connect of an app session
+                                // (exactly when this "idle" badge runs), those scores are still
+                                // at their default 1/1 - equal - regardless of what the user
+                                // actually saved, which sent preferredIdentityPath() into the
+                                // equal-score tie-break (defaults to Wi-Fi) instead of the
+                                // user's real preference. Loading the persisted scores here
+                                // first makes this call correct independent of whether a VPN
+                                // session has ever started yet.
+                                DynamicWeightCalculator.configureUserScores(
+                                    wifiScore = NetworkPreferenceStore.wifiScore(applicationContext),
+                                    cellularScore = NetworkPreferenceStore.cellularScore(applicationContext),
+                                )
                                 val (wifi, cellular) = NetworkMonitor.snapshotPhysicalNetworks(applicationContext)
                                 val identity = DynamicWeightCalculator.preferredIdentityPath(
                                     wifiAvailable = wifi != null,
