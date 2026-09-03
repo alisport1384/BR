@@ -184,14 +184,17 @@ class TunPacketRouter(
 
         if (wifi != null && cellular != null) {
             val count = packetCounter.getAndIncrement()
-            // The first flow after a weight change is always placed on the user-preferred
-            // path. This is important for control/metadata connections (including IP checks):
-            // a 90/10 preference must not randomly start on the 10% path. Subsequent flows use
-            // the configured weighted distribution.
+            // The first flow after a weight change always follows the identity policy
+            // (DynamicWeightCalculator.preferredIdentityPath) instead of the weighted split
+            // below. This matters for control/metadata connections (including IP checks): a
+            // 90/10 preference must not randomly start on the 10% path, and - unlike a plain
+            // weight comparison - this also respects the equal-score stability/reconnect-based
+            // owner instead of defaulting to Wi-Fi whenever both shares happen to be equal.
+            // Subsequent flows use the configured weighted distribution as before.
             if (count == 0) {
-                return when {
-                    wifiWeight > cellularWeight -> wifi
-                    cellularWeight > wifiWeight -> cellular
+                return when (DynamicWeightCalculator.preferredIdentityPath(wifiAvailable = true, cellularAvailable = true)) {
+                    "wifi" -> wifi
+                    "cellular" -> cellular
                     else -> wifi
                 }
             }
