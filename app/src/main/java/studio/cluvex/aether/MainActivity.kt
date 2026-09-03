@@ -28,6 +28,8 @@ import studio.cluvex.aether.core.AetherController
 import studio.cluvex.aether.core.IpEndpoint
 import studio.cluvex.aether.core.NetProbe
 import studio.cluvex.aether.core.TunnelConfig
+import com.bigrocket.service.DynamicWeightCalculator
+import com.bigrocket.service.NetworkMonitor
 import studio.cluvex.aether.data.OnboardingStore
 import studio.cluvex.aether.data.ProfileStore
 import studio.cluvex.aether.model.ConnectionProfile
@@ -188,7 +190,34 @@ class MainActivity : ComponentActivity() {
                         "idle" -> {
                             AetherController.setIpInfo(null)
                             AetherController.setIpLoading(true)
-                            val info = withContext(Dispatchers.IO) { NetProbe.fetchIpInfoDirectWithRetry() }
+                            val info = withContext(Dispatchers.IO) {
+                                // Do NOT use fetchIpInfoDirectWithRetry() here: it opens a
+                                // plain, unbound socket, so Android's OWN default-network
+                                // selection decides which physical path answers - not the
+                                // user's wifi/cellular score. preferredIdentityPath() is the
+                                // single source of truth for "which path's IP should be
+                                // shown" (see its doc comment in DynamicWeightCalculator);
+                                // fetchIpInfoDirectViaNetwork forces the probe onto that
+                                // exact physical Network.
+                                val (wifi, cellular) = NetworkMonitor.snapshotPhysicalNetworks(applicationContext)
+                                val identity = DynamicWeightCalculator.preferredIdentityPath(
+                                    wifiAvailable = wifi != null,
+                                    cellularAvailable = cellular != null,
+                                )
+                                val targetNetwork = when (identity) {
+                                    "wifi" -> wifi
+                                    "cellular" -> cellular
+                                    else -> null
+                                }
+                                if (targetNetwork != null) {
+                                    NetProbe.fetchIpInfoDirectViaNetworkWithRetry(targetNetwork)
+                                } else {
+                                    // Neither path is up (or, in principle, no identity could
+                                    // be established yet) - nothing to force onto, fall back
+                                    // to the OS default so the badge can still show something.
+                                    NetProbe.fetchIpInfoDirectWithRetry()
+                                }
+                            }
                             AetherController.setIpInfo(info?.let { IpEndpoint(it.ip, it.countryCode, false) })
                             AetherController.setIpLoading(false)
                         }
