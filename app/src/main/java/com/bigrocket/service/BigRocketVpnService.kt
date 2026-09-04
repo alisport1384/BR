@@ -70,6 +70,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var packetRouter: TunPacketRouter? = null
+    // Local SOCKS5 upstream for Aether: Aether's external transport is always
+    // dialed through BigRocket's weighted physical-path bonding first.
+    private var bondingUpstream: BondingSocksServer? = null
     private var networkMonitor: NetworkMonitor? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -340,6 +343,18 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 it.start()
             }
 
+            // This listener is the physical-network boundary for Aether. Aether
+            // connects to it as SOCKS5 upstream; the listener then pins each
+            // relay to Wi-Fi/Cellular using the same bonding weights as the
+            // direct BigRocket path. Aether is therefore downstream of the
+            // BigRocket bonded transport, never a separate physical path.
+            bondingUpstream = BondingSocksServer(this).also {
+                it.updateNetworks(wifiNetwork, cellularNetwork)
+                it.updateWeights(50, 50)
+                it.setUpstreamMode(UpstreamMode.NONE)
+                it.start()
+            }
+
             // The monitor may have discovered the physical transports before establish().
             // Apply that snapshot now that the router/TUN actually exists.
             onNetworksUpdated(wifiNetwork, cellularNetwork)
@@ -370,6 +385,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         if (cellular == null) cellularHealth.update(null, LatencyTester.FAILURE)
 
         packetRouter?.updateNetworks(wifi, cellular)
+        bondingUpstream?.updateNetworks(wifi, cellular)
 
         val bothAvailable = wifi != null && cellular != null
         val pathRecovered =
@@ -382,6 +398,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             wifi == null && cellular == null -> {
                 DynamicWeightCalculator.clear()
                 packetRouter?.updateWeights(0, 0)
+                bondingUpstream?.updateWeights(0, 0)
             }
             !bothAvailable -> {
                 DynamicWeightCalculator.update(
@@ -389,13 +406,17 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     wifiLatency = 1,
                     cellularAvailable = cellular != null,
                     cellularLatency = 1
-                ).also { packetRouter?.updateWeights(it.wifiWeight, it.cellularWeight) }
+                ).also {
+                    packetRouter?.updateWeights(it.wifiWeight, it.cellularWeight)
+                    bondingUpstream?.updateWeights(it.wifiWeight, it.cellularWeight)
+                }
             }
             pathRecovered -> {
                 val reset = DynamicWeightCalculator.resetForPathRecovery(
                     recoveredWifi = oldWifi == null || (wifi != null && oldWifi != wifi)
                 )
                 packetRouter?.updateWeights(reset.wifiWeight, reset.cellularWeight)
+                bondingUpstream?.updateWeights(reset.wifiWeight, reset.cellularWeight)
             }
         }
 
@@ -481,10 +502,16 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 // Only evict pinned sessions after the keep-alive hysteresis confirms a real
                 // soft failure. A single missed probe never moves sessions or changes UI state.
                 if (previousWifiOk && !wifiOk && wifi != null) {
-                    cellular?.let { packetRouter?.notifySoftFailure(wifi, it) }
+                    cellular?.let {
+                        packetRouter?.notifySoftFailure(wifi, it)
+                        bondingUpstream?.notifySoftFailure(wifi)
+                    }
                 }
                 if (previousCellularOk && !cellularOk && cellular != null) {
-                    wifi?.let { packetRouter?.notifySoftFailure(cellular, it) }
+                    wifi?.let {
+                        packetRouter?.notifySoftFailure(cellular, it)
+                        bondingUpstream?.notifySoftFailure(cellular)
+                    }
                 }
 
                 val pathRecoveredAfterProbe =
@@ -499,6 +526,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                         recoveredWifi = (!previousWifiOk && wifiOk)
                     )
                     packetRouter?.updateWeights(reset.wifiWeight, reset.cellularWeight)
+                    bondingUpstream?.updateWeights(reset.wifiWeight, reset.cellularWeight)
                 }
 
                 val weights = DynamicWeightCalculator.update(
@@ -509,6 +537,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 )
 
                 packetRouter?.updateWeights(weights.wifiWeight, weights.cellularWeight)
+                bondingUpstream?.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 packetRouter?.setUpstreamMode(
                     when {
                         EmbeddedAetherRuntime.isTrafficReady() -> UpstreamMode.AETHER
@@ -579,6 +608,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         }
         packetRouter?.stop()
         packetRouter = null
+
+        bondingUpstream?.stop()
+        bondingUpstream = null
 
         try {
             vpnInterface?.close()
