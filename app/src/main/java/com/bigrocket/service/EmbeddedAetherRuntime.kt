@@ -40,7 +40,13 @@ object EmbeddedAetherRuntime {
             runCatching {
                 AetherController.setState(ConnectionState.Launching)
                 EngineMeta.reset()
-                val embeddedProfile = profile.copy(proxyMode = true)
+                // Aether must consume BigRocket's already-bonded transport. Its own
+                // physical dials are therefore chained through the local SOCKS5
+                // bonding boundary instead of going directly to Wi-Fi/Cellular.
+                val embeddedProfile = profile.copy(
+                    proxyMode = true,
+                    upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
+                )
                 ProfileStore(app).save(embeddedProfile)
                 val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
                 process = engine
