@@ -14,6 +14,32 @@ class NetworkMonitor(
         fun onNetworksUpdated(wifi: Network?, cellular: Network?)
     }
 
+    companion object {
+        /**
+         * One-shot snapshot of the current physical Wi-Fi/Cellular Networks, without
+         * registering any callback or requiring a running NetworkMonitor/VpnService instance.
+         * Used by the identity/IP badge (see DynamicWeightCalculator.preferredIdentityPath):
+         * the resting "your real IP" display needs live Network references even while the
+         * VPN itself is idle/disconnected. Shares the same transport-detection rules as the
+         * instance-based listener below so both paths agree on what counts as Wi-Fi/Cellular.
+         */
+        fun snapshotPhysicalNetworks(context: Context): Pair<Network?, Network?> {
+            val cm = context.applicationContext
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            var wifi: Network? = null
+            var cellular: Network? = null
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+                when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> wifi = network
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> cellular = network
+                }
+            }
+            return wifi to cellular
+        }
+    }
+
     private val connectivityManager =
         context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
