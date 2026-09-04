@@ -16,14 +16,6 @@ class TunPacketRouter(
     private val vpnInterface: ParcelFileDescriptor,
     private val vpnService: BigRocketVpnService
 ) {
-    private companion object {
-        // How long after connecting (or after a real weight change) new connections keep
-        // following the identity policy instead of the weighted split. Long enough to cover a
-        // user manually switching to a browser and loading an IP-checker site right after
-        // pressing Connect (a few seconds, per real observed usage), short enough that normal
-        // load-balanced bonding still dominates the session.
-        const val IDENTITY_WINDOW_MS = 20_000L
-    }
 
     // SupervisorJob: see the identical comment in TcpRelayEngine.kt. routerJob (the
     // single TUN-read loop) also lives under this scope, so without SupervisorJob a
@@ -39,22 +31,8 @@ class TunPacketRouter(
     @Volatile private var wifiWeight = 50
     @Volatile private var cellularWeight = 50
     // Randomized starting phase, not 0, so the round-robin's early proportions aren't
-    // deterministically biased the same way every single session (statistical fairness only -
-    // see identityWindowUntilMs below for the actual "which path gets new connections right
-    // after connecting" decision, which no longer depends on this counter at all).
+    // deterministically biased the same way every single session.
     private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
-
-    // While now < this, EVERY new connection (not just literally the first one) follows the
-    // identity policy instead of the weighted split. A single-connection "first flow" special
-    // case sounds right in theory but does not survive real usage: within a few seconds of
-    // connecting, a phone's background chatter (Play Services, push/keepalive, app sync, ...)
-    // typically opens several connections before the user manually does anything - by the time
-    // they open a browser to check "what is my IP", connection #1 (identity-eligible) is long
-    // gone and their own check lands in the ordinary weighted split, where a modest preference
-    // (e.g. score 2 vs 1 -> 60/40) legitimately picks the minority path close to half the time.
-    // A time window, not a connection count, is what actually matches "check right after
-    // connecting" - see IDENTITY_WINDOW_MS.
-    @Volatile private var identityWindowUntilMs: Long = System.currentTimeMillis() + IDENTITY_WINDOW_MS
 
     private val sessionTracker = NetworkSessionTracker()
     private val udpRelayEngine = UdpRelayEngine(vpnService)
@@ -118,10 +96,7 @@ class TunPacketRouter(
         val changed = this.wifiWeight != wifiW || this.cellularWeight != cellularW
         this.wifiWeight = wifiW
         this.cellularWeight = cellularW
-        if (changed) {
-            packetCounter.set(kotlin.random.Random.nextInt(100))
-            identityWindowUntilMs = System.currentTimeMillis() + IDENTITY_WINDOW_MS
-        }
+        if (changed) packetCounter.set(kotlin.random.Random.nextInt(100))
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -199,21 +174,17 @@ class TunPacketRouter(
         val cellular = cellularNetwork
 
         if (wifi != null && cellular != null) {
-            // Every new connection opened within IDENTITY_WINDOW_MS of connecting (or of the
-            // last real weight change) follows the identity policy
-            // (DynamicWeightCalculator.preferredIdentityPath) instead of the weighted split
-            // below. This matters for control/metadata connections (including IP checks): a
-            // 90/10 preference must not randomly start on the 10% path, and - unlike a plain
-            // weight comparison - this also respects the equal-score stability/reconnect-based
-            // owner instead of defaulting to Wi-Fi whenever both shares happen to be equal.
-            // Once the window elapses, flows use the configured weighted distribution.
-            if (System.currentTimeMillis() < identityWindowUntilMs) {
-                return when (DynamicWeightCalculator.preferredIdentityPath(wifiAvailable = true, cellularAvailable = true)) {
-                    "wifi" -> wifi
-                    "cellular" -> cellular
-                    else -> wifi
-                }
-            }
+            // Real traffic ALWAYS uses the weighted split, unconditionally - never the identity
+            // policy. An earlier version routed every new connection through
+            // DynamicWeightCalculator.preferredIdentityPath() for a time window after
+            // connecting, meant only to make a manual "what is my IP" check reflect the user's
+            // score. That leaked into real traffic too: preferredIdentityPath() returns null
+            // until ~5s of latency samples exist, and the window's fallback for null defaulted
+            // to Wi-Fi - so any download/upload connection opened in roughly the first 5
+            // seconds after connecting (a very common case: connect, then immediately start a
+            // transfer) was pinned to Wi-Fi for its entire lifetime regardless of score. Identity
+            // is a separate, opt-in query (see preferredIdentityPath's own callers) and must
+            // never again decide which physical network real traffic uses.
             val count = packetCounter.getAndIncrement()
             val slot = Math.floorMod(count, 100)
             return if (slot < wifiWeight) wifi else cellular
