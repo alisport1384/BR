@@ -8,11 +8,13 @@ import kotlin.math.abs
  * User scores are authoritative for routing whenever they differ. Observed quality may only
  * influence the routing split when the user gives both paths the same score.
  *
- * Identity/IP selection is intentionally independent from routing share. When scores are equal,
- * connection stability can move the identity owner from a flapping path to the other path.
- * The first owner is allowed 2 reconnects in a rolling minute; every subsequent owner receives
- * the next threshold (3, 4, ...). This escalation is only an identity rule and never changes
- * routing weights.
+ * Identity/IP selection is intentionally independent from routing share, and is sticky: once a
+ * path owns identity, it keeps it regardless of score/latency until it is the one that actually
+ * goes down - at which point the other path takes over immediately and becomes sticky in turn.
+ * The very first assignment (only, before any handoff has ever happened) is decided by: the
+ * higher user score if scores differ, or whichever path shows the better latency during the
+ * first ~5 seconds of monitoring if scores are equal. See preferredIdentityPath for the full
+ * state machine.
  */
 object DynamicWeightCalculator {
 
@@ -23,9 +25,6 @@ object DynamicWeightCalculator {
     private const val MIN_WEIGHT = 15
     private const val RECOVERY_START_WEIGHT = 10
     private const val RECOVERY_STEP = 10
-
-    private const val INITIAL_IDENTITY_RECONNECT_LIMIT = 2
-    private const val IDENTITY_RECONNECT_WINDOW_MS = 60_000L
 
     private enum class Path { WIFI, CELLULAR }
 
@@ -44,11 +43,10 @@ object DynamicWeightCalculator {
     @Volatile private var recoveringPath: Path? = null
     @Volatile private var recoveryWeight = RECOVERY_START_WEIGHT
 
-    // Identity/IP stability state. Never use these values to alter routing share.
-    private val wifiReconnects = ArrayDeque<Long>()
-    private val cellularReconnects = ArrayDeque<Long>()
-    private var identityOwner: Path? = null
-    private var identityReconnectLimit = INITIAL_IDENTITY_RECONNECT_LIMIT
+    // Identity/IP stability state. Never use this value to alter routing share. null means "no
+    // owner assigned yet" - either nothing has ever been decided, or both paths are currently
+    // down. See preferredIdentityPath for how this is assigned/handed off.
+    @Volatile private var identityOwner: Path? = null
 
     @Synchronized
     fun configureUserScores(wifiScore: Int, cellularScore: Int) {
@@ -61,12 +59,10 @@ object DynamicWeightCalculator {
         samples.clear()
         currentWeights = preferredWeights()
 
-        // Identity policy changes only its score-authority mode. Reconnect history remains
-        // intact because it is real stability evidence, not routing state.
-        if (wifiUserScore != cellularUserScore) {
-            identityOwner = null
-            identityReconnectLimit = INITIAL_IDENTITY_RECONNECT_LIMIT
-        }
+        // A score change is an explicit user command: identity is freshly (re-)decided under
+        // the 0-5s monitoring gate below. Once assigned, it stays sticky exactly as if scores
+        // had never changed - see preferredIdentityPath.
+        identityOwner = null
     }
 
     fun wifiScore(): Int = wifiUserScore
@@ -82,67 +78,58 @@ object DynamicWeightCalculator {
     /**
      * Selects which physical path may determine the externally visible IP/identity.
      *
-     * Unequal user scores always win, regardless of latency or stability.
-     * Equal scores activate the independent stability policy:
-     *   - current identity owner starts with a 2-reconnect/minute allowance;
-     *   - when that owner reaches its allowance, identity moves to the other path;
-     *   - the new owner receives the next allowance (3, then 4, ...);
-     *   - if the next owner reaches its allowance, the same rule continues.
+     * State machine (see the class doc comment for the summary):
+     *  - Exactly one path up -> that path owns identity immediately, no monitoring wait
+     *    (there is no choice to make, and an active outage must fail over instantly, not wait
+     *    on a monitoring window meant only for comparing two healthy paths). This ALSO updates
+     *    the sticky owner, so when the other path comes back the previous owner is not silently
+     *    reinstated - identity stays on whichever path just carried the traffic during the
+     *    outage until that one itself goes down.
+     *  - Both paths up, an owner is already assigned -> sticky: keep it regardless of
+     *    score/latency. The owner only ever changes via the single-path branch above, i.e.
+     *    only by actually going down - never by the other path merely "looking better".
+     *  - Both paths up, no owner yet (first-ever decision, or both were down and both just came
+     *    back simultaneously) -> gated by ~5 seconds of real monitoring (samples.size reaching
+     *    MIN_SAMPLES_FOR_DECISION, matching the probe loop's ~1s cadence) so the very first
+     *    pick is not made on zero information. Unequal scores: the higher score wins outright.
+     *    Equal scores: whichever path had the better (lower) median latency during that
+     *    monitoring window wins.
      *
      * Routing weights are never changed by this method.
      */
     @Synchronized
     fun preferredIdentityPath(wifiAvailable: Boolean, cellularAvailable: Boolean): String? {
-        if (!wifiAvailable && !cellularAvailable) return null
-        if (wifiAvailable && !cellularAvailable) return "wifi"
-        if (!wifiAvailable && cellularAvailable) return "cellular"
-
-        // User preference is absolute for identity when scores differ.
-        if (wifiUserScore > cellularUserScore) return "wifi"
-        if (cellularUserScore > wifiUserScore) return "cellular"
-
-        val wifiCount = reconnectCount(Path.WIFI)
-        val cellularCount = reconnectCount(Path.CELLULAR)
-
-        if (identityOwner == null) {
-            // Equal scores: establish the first owner from stability evidence. If equally stable,
-            // use the current routing split only as a deterministic tie-breaker for identity.
-            identityOwner = when {
-                wifiCount < cellularCount -> Path.WIFI
-                cellularCount < wifiCount -> Path.CELLULAR
-                currentWeights.wifiWeight >= currentWeights.cellularWeight -> Path.WIFI
-                else -> Path.CELLULAR
-            }
-            identityReconnectLimit = INITIAL_IDENTITY_RECONNECT_LIMIT
-        }
-
-        val owner = identityOwner!!
-        val ownerCount = reconnectCount(owner)
-        if (ownerCount < identityReconnectLimit) {
-            return owner.name.lowercase()
-        }
-
-        // The current owner has exceeded its stability allowance. Transfer identity only.
-        val other = if (owner == Path.WIFI) Path.CELLULAR else Path.WIFI
-        val nextLimit = (identityReconnectLimit + 1).coerceAtLeast(
-            INITIAL_IDENTITY_RECONNECT_LIMIT + 1
-        )
-        val otherCount = reconnectCount(other)
-
-        // The next owner gets the next stability allowance (3, then 4, ...). If it has
-        // already exhausted that allowance, it must relinquish identity as well. With only
-        // two physical paths there is then deliberately no identity owner until the rolling
-        // reconnect history makes a path eligible again. This is safer than bouncing the IP
-        // between two unstable paths.
-        if (otherCount >= nextLimit) {
+        if (!wifiAvailable && !cellularAvailable) {
+            // Nothing to own. Deliberately do NOT keep the old owner "pending" - once both
+            // paths have been down, whichever comes back first should not be forced to wait on
+            // the other, so the single-path branches below are free to (re-)assign fresh.
             identityOwner = null
-            identityReconnectLimit = nextLimit
             return null
         }
 
-        identityOwner = other
-        identityReconnectLimit = nextLimit
-        return other.name.lowercase()
+        if (wifiAvailable && !cellularAvailable) {
+            identityOwner = Path.WIFI
+            return "wifi"
+        }
+        if (!wifiAvailable && cellularAvailable) {
+            identityOwner = Path.CELLULAR
+            return "cellular"
+        }
+
+        // Both paths are up from here on.
+        identityOwner?.let { return it.name.lowercase() }
+
+        // No owner yet: decide the very first assignment, gated by ~5s of real monitoring.
+        if (samples.size < MIN_SAMPLES_FOR_DECISION) return null
+
+        identityOwner = if (wifiUserScore != cellularUserScore) {
+            if (wifiUserScore > cellularUserScore) Path.WIFI else Path.CELLULAR
+        } else {
+            val wifiMedian = median(samples.map { it.wifiLatencyMs })
+            val cellularMedian = median(samples.map { it.cellularLatencyMs })
+            if (wifiMedian <= cellularMedian) Path.WIFI else Path.CELLULAR
+        }
+        return identityOwner!!.name.lowercase()
     }
 
     /** Returns whether [path] is currently eligible to determine identity/IP. */
@@ -154,24 +141,6 @@ object DynamicWeightCalculator {
         }
         val selected = preferredIdentityPath(true, true)
         return selected == normalized
-    }
-
-    private fun reconnectCount(path: Path): Int {
-        val now = System.currentTimeMillis()
-        val queue = if (path == Path.WIFI) wifiReconnects else cellularReconnects
-        while (queue.isNotEmpty() && now - queue.first() >= IDENTITY_RECONNECT_WINDOW_MS) {
-            queue.removeFirst()
-        }
-        return queue.size
-    }
-
-    private fun recordReconnect(path: Path) {
-        val now = System.currentTimeMillis()
-        val queue = if (path == Path.WIFI) wifiReconnects else cellularReconnects
-        queue.addLast(now)
-        while (queue.isNotEmpty() && now - queue.first() >= IDENTITY_RECONNECT_WINDOW_MS) {
-            queue.removeFirst()
-        }
     }
 
     @Synchronized
@@ -280,10 +249,10 @@ object DynamicWeightCalculator {
         return currentWeights
     }
 
-    /** Reintroduces a recovered path at 10%; this records the reconnect for identity stability. */
+    /** Reintroduces a recovered path at 10%. This is a routing-share concern only - see
+     *  preferredIdentityPath for how identity/IP reacts to the same recovery independently. */
     @Synchronized
     fun resetForPathRecovery(recoveredWifi: Boolean): NetworkWeights {
-        recordReconnect(if (recoveredWifi) Path.WIFI else Path.CELLULAR)
         samples.clear()
         recoveringPath = if (recoveredWifi) Path.WIFI else Path.CELLULAR
         recoveryWeight = RECOVERY_START_WEIGHT
@@ -313,7 +282,6 @@ object DynamicWeightCalculator {
         recoveryWeight = RECOVERY_START_WEIGHT
         currentWeights = preferredWeights()
         identityOwner = null
-        identityReconnectLimit = INITIAL_IDENTITY_RECONNECT_LIMIT
     }
 
     fun currentWeights(): NetworkWeights = currentWeights
