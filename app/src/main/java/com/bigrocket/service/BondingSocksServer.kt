@@ -315,29 +315,29 @@ class BondingSocksServer(private val vpnService: VpnService) {
             return
         }
 
-        // Dual-path state for the real-dial (NONE-mode, aetherAssociation == null) branch: two
-        // persistent raw sockets targeting this association's single remote destination - one
-        // per physical path - instead of one path chosen once and cached for the whole session.
+        // Single-path state for the real-dial (NONE-mode, aetherAssociation == null) branch:
+        // exactly one raw socket, bound once via the same weighted pickNetwork() the TCP
+        // CONNECT branch uses, for this association's entire lifetime.
         //
-        // This is safe SPECIFICALLY because this branch carries Aether's own WireGuard traffic
-        // (BondingSocksServer is Aether's configured upstreamProxy - see EmbeddedAetherRuntime).
-        // WireGuard identifies a peer by decrypting with its session key, not by source IP -
-        // that is exactly what lets a phone roam between Wi-Fi and Cellular mid-tunnel without
-        // dropping the connection. So genuinely interleaving this one tunnel's packets across
-        // both physical source IPs is safe here. This does NOT generalize to the directTargets
-        // logic used for ordinary destinations elsewhere in this file: a normal TCP/UDP peer
-        // identifies a flow by source IP, so splitting its packets across two source IPs would
-        // break it - only this WireGuard destination tolerates it.
-        var wifiSocket: DatagramSocket? = null
-        var wifiBoundTo: Network? = null
-        var cellularSocket: DatagramSocket? = null
-        var cellularBoundTo: Network? = null
-        var destHost: String? = null
-        var destPort = 0
-        val lastClientAddr = java.util.concurrent.atomic.AtomicReference<InetSocketAddress?>(null)
-        val receiverJobs = mutableListOf<Job>()
+        // This branch carries Aether's own WireGuard/GOOL tunnel (BondingSocksServer is
+        // Aether's configured upstreamProxy - see EmbeddedAetherRuntime). An earlier version
+        // of this code alternated the source socket per outgoing packet on the theory that
+        // WireGuard tolerates roaming (it identifies a peer by session key, not source IP).
+        // That assumption is true for the CLIENT's outbound side but not for the resulting
+        // downlink: a roaming-capable peer sends ALL return traffic to whichever source
+        // address it most recently saw a valid packet from - a single "current endpoint",
+        // not both at once. Alternating the source every packet made the server's notion of
+        // "current endpoint" thrash on every packet, so the download direction (the bulk of
+        // any real transfer) collapsed onto whichever path happened to win that race - in
+        // practice mostly Wi-Fi - which is exactly the single-path-saturation symptom this
+        // was meant to fix. Pinning one physical path per association removes the thrash;
+        // weight is honored across associations/reconnects instead of within one, the same
+        // flow-level granularity already used everywhere else in this file and in
+        // TunPacketRouter.
+        var pinnedSocket: DatagramSocket? = null
+        var receiverJob: Job? = null
 
-        fun bindDualSocket(network: Network): DatagramSocket? = runCatching {
+        fun bindPinnedSocket(network: Network): DatagramSocket? = runCatching {
             val s = DatagramSocket()
             if (!vpnService.protect(s)) { s.close(); return@runCatching null }
             network.bindSocket(s)
@@ -345,65 +345,26 @@ class BondingSocksServer(private val vpnService: VpnService) {
             s
         }.getOrNull()
 
-        fun startDualReceiver(socket: DatagramSocket, host: String, port: Int): Job = scope.launch {
-            val respBuf = ByteArray(64 * 1024)
-            try {
-                while (isActive && !socket.isClosed) {
-                    val resp = DatagramPacket(respBuf, respBuf.size)
-                    try {
-                        socket.receive(resp)
-                    } catch (_: SocketTimeoutException) {
-                        continue
-                    } catch (_: Exception) {
-                        break
+        fun startPinnedReceiver(socket: DatagramSocket, host: String, port: Int, clientAddr: InetSocketAddress): Job =
+            scope.launch {
+                val respBuf = ByteArray(64 * 1024)
+                try {
+                    while (isActive && !socket.isClosed) {
+                        val resp = DatagramPacket(respBuf, respBuf.size)
+                        try {
+                            socket.receive(resp)
+                        } catch (_: SocketTimeoutException) {
+                            continue
+                        } catch (_: Exception) {
+                            break
+                        }
+                        val encoded = encodeSocksUdp(host, port, resp.data.copyOf(resp.length))
+                        runCatching { localUdp.send(DatagramPacket(encoded, encoded.size, clientAddr)) }
+                        TrafficStats.recordBytes(resp.length)
                     }
-                    // The server replies to whichever source IP it most recently saw a valid
-                    // packet from, so a reply can legitimately arrive on either socket - both
-                    // receivers forward everything back to Aether the same way.
-                    val addr = lastClientAddr.get() ?: continue
-                    val encoded = encodeSocksUdp(host, port, resp.data.copyOf(resp.length))
-                    runCatching { localUdp.send(DatagramPacket(encoded, encoded.size, addr)) }
-                    TrafficStats.recordBytes(resp.length)
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        fun ensureDualSockets() {
-            val wifi = wifiNetwork
-            val cellular = cellularNetwork
-            if (wifi != wifiBoundTo) {
-                runCatching { wifiSocket?.close() }
-                wifiSocket = wifi?.let { bindDualSocket(it) }
-                wifiBoundTo = wifi
-                val host = destHost
-                if (wifiSocket != null && host != null) {
-                    receiverJobs += startDualReceiver(wifiSocket!!, host, destPort)
+                } catch (_: Exception) {
                 }
             }
-            if (cellular != cellularBoundTo) {
-                runCatching { cellularSocket?.close() }
-                cellularSocket = cellular?.let { bindDualSocket(it) }
-                cellularBoundTo = cellular
-                val host = destHost
-                if (cellularSocket != null && host != null) {
-                    receiverJobs += startDualReceiver(cellularSocket!!, host, destPort)
-                }
-            }
-        }
-
-        // This relay's ActiveRelay.network is deliberately left null (never a single path) so
-        // notifySoftFailure - built for single-path relays - never tears down this association
-        // just because ONE of its two paths died. ensureDualSockets() above already reacts to
-        // either path individually and keeps the association alive on whichever path survives.
-        activeRelays[relayId] = ActiveRelay(null) {
-            runCatching { client.close() }
-            runCatching { localUdp.close() }
-            runCatching { aetherAssociation?.close() }
-            runCatching { wifiSocket?.close() }
-            runCatching { cellularSocket?.close() }
-            receiverJobs.forEach { it.cancel() }
-        }
 
         // TUN ASSOCIATE lives for as long as the SOCKS5 control TCP connection stays open -
         // this small watcher just closes the UDP side (and unblocks the receive loop below)
@@ -416,6 +377,17 @@ class BondingSocksServer(private val vpnService: VpnService) {
             } finally {
                 runCatching { localUdp.close() }
             }
+        }
+
+        // Registered once the pinned path is known (first packet); a soft-failure on that
+        // specific Network then tears this association down like any single-path relay,
+        // letting the tunnel reconnect and get a fresh weighted pick on the surviving path.
+        activeRelays[relayId] = ActiveRelay(null) {
+            runCatching { client.close() }
+            runCatching { localUdp.close() }
+            runCatching { aetherAssociation?.close() }
+            runCatching { pinnedSocket?.close() }
+            receiverJob?.cancel()
         }
 
         val buffer = ByteArray(64 * 1024)
@@ -434,7 +406,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
                 lastActivity = System.currentTimeMillis()
                 val decoded = decodeSocksUdp(packet.data, packet.length) ?: continue
                 val fromAddr = packet.socketAddress as? InetSocketAddress ?: continue
-                lastClientAddr.set(fromAddr)
 
                 if (aetherAssociation != null) {
                     runCatching { aetherAssociation.send(decoded.host, decoded.port, decoded.payload) }
@@ -446,19 +417,17 @@ class BondingSocksServer(private val vpnService: VpnService) {
                     continue
                 }
 
-                if (destHost == null) {
-                    destHost = decoded.host
-                    destPort = decoded.port
+                if (pinnedSocket == null) {
+                    val network = pickNetwork() ?: continue // both paths down - drop, same as before
+                    val socket = bindPinnedSocket(network) ?: continue
+                    pinnedSocket = socket
+                    activeRelays[relayId]?.network = network
+                    receiverJob = startPinnedReceiver(socket, decoded.host, decoded.port, fromAddr)
                 }
-                ensureDualSockets()
-
-                // Real per-packet bonding: a fresh weighted pick for THIS packet, not a choice
-                // cached once for the whole session (see the class doc above this block).
-                val chosen = pickBondedSocket(wifiSocket, cellularSocket)
-                if (chosen == null) continue // both paths currently down - drop, same as before
+                val socket = pinnedSocket ?: continue
                 runCatching {
                     val dest = InetSocketAddress(InetAddress.getByName(decoded.host), decoded.port)
-                    chosen.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
+                    socket.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
                 }
                 TrafficStats.recordBytes(decoded.payload.size)
             }
@@ -467,23 +436,10 @@ class BondingSocksServer(private val vpnService: VpnService) {
             activeRelays.remove(relayId)
             runCatching { localUdp.close() }
             runCatching { aetherAssociation?.close() }
-            runCatching { wifiSocket?.close() }
-            runCatching { cellularSocket?.close() }
-            receiverJobs.forEach { it.cancel() }
+            runCatching { pinnedSocket?.close() }
+            receiverJob?.cancel()
             closeQuietly(client)
         }
-    }
-
-    /** Weighted per-call pick between two already-bound sockets for [handleUdpAssociate]'s
-     *  dual-path branch - same weighting as [pickNetwork], just returning a live socket
-     *  instead of a Network since the caller already owns both bound sockets. */
-    private fun pickBondedSocket(wifi: DatagramSocket?, cellular: DatagramSocket?): DatagramSocket? {
-        if (wifi != null && cellular != null) {
-            val count = packetCounter.getAndIncrement()
-            val slot = Math.floorMod(count, 100)
-            return if (slot < wifiWeight) wifi else cellular
-        }
-        return wifi ?: cellular
     }
 
     private data class DecodedUdp(val host: String, val port: Int, val payload: ByteArray)
