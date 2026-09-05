@@ -53,12 +53,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
     @Volatile private var cellularWeight = 50
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
-    // Randomized starting phase, not 0 - identical reasoning/fix to
-    // TunPacketRouter.packetCounter: starting at a fixed 0 made the very first new
-    // connection after every weight change/session start deterministically land on
-    // Wi-Fi whenever wifiWeight > 0, regardless of how low the configured share was
-    // (a single download is exactly one connection, so it always ran at Wi-Fi's speed).
-    private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
@@ -102,10 +96,8 @@ class BondingSocksServer(private val vpnService: VpnService) {
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
-        val changed = wifiWeight != wifiW || cellularWeight != cellularW
         wifiWeight = wifiW
         cellularWeight = cellularW
-        if (changed) packetCounter.set(kotlin.random.Random.nextInt(100))
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -124,31 +116,25 @@ class BondingSocksServer(private val vpnService: VpnService) {
         }
     }
 
-    private fun pickNetwork(): Network? {
-        val wifi = wifiNetwork
-        val cellular = cellularNetwork
-        if (wifi != null && cellular != null) {
-            // Real traffic ALWAYS uses the weighted split, unconditionally - never the identity
-            // policy. See the extended reasoning on TunPacketRouter.selectNetworkForPacket,
-            // which applies identically here: routing every new connection through identity for
-            // a time window pinned real downloads/uploads opened in roughly the first 5 seconds
-            // after connecting to Wi-Fi (identity's null-until-monitored fallback), regardless
-            // of score. Identity must never decide which physical network real traffic uses.
-            val count = packetCounter.getAndIncrement()
-            val slot = Math.floorMod(count, 100)
-            return if (slot < wifiWeight) wifi else cellular
-        }
-        return wifi ?: cellular
-    }
-
-    /** Deterministic best-path pick, used only for [handleUdpAssociate]'s single pinned
-     *  association (Aether's own tunnel: one long-lived flow for the whole VPN session, not
-     *  many short-lived ones). [pickNetwork]'s weighted-random split is correct for ordinary
-     *  traffic because it is sampled hundreds of times, so the outcome converges to the
-     *  configured ratio; sampled exactly once, it just as often lands on the low-weight path
-     *  outright and pins the entire tunnel there for the whole session. Picking the strictly
-     *  higher-weight network here removes that single-sample variance; ties fall back to
-     *  [pickNetwork] since either path is equally acceptable. */
+    /** Deterministic best-path pick. This class has exactly one instance
+     *  (BigRocketVpnService.bondingUpstream), used exclusively as Aether's own upstreamProxy -
+     *  every connection/association it ever handles (TCP CONNECT for a GOOL/TCP tunnel, UDP
+     *  ASSOCIATE for a WireGuard/MASQUE tunnel) is one long-lived flow for the whole VPN
+     *  session, not one of many short-lived ones. A weighted-random sample is only meaningful
+     *  when it is drawn many times so the outcome converges to the configured ratio; drawn
+     *  exactly once, it just as often lands on the low-weight path outright and pins the
+     *  entire session there. This never uses chance:
+     *  unequal weights mean the app's own engine (DynamicWeightCalculator) has an authoritative
+     *  answer already (a user-set score difference, or a measured quality difference), so the
+     *  higher-weight network wins outright; an exact tie is resolved by that same engine's own
+     *  identity tie-break rule (recent measured latency - see preferredIdentityPath), not by a
+     *  fresh coin flip here. An exact tie only happens when the user has given both paths the
+     *  same score (unequal scores always produce unequal weights - see
+     *  DynamicWeightCalculator.preferredWeights), so it is rare and, either way, genuinely
+     *  arbitrary: Wi-Fi is picked, fixed and not random. (DynamicWeightCalculator's own
+     *  identity/IP tie-break is deliberately not reused here - it mutates a separate sticky
+     *  identity-owner state meant for a different feature, and calling it here would silently
+     *  decide/consume that state as a side effect of an unrelated bonding pin.) */
     private fun pickBestNetwork(): Network? {
         val wifi = wifiNetwork
         val cellular = cellularNetwork
@@ -156,7 +142,7 @@ class BondingSocksServer(private val vpnService: VpnService) {
             return when {
                 wifiWeight > cellularWeight -> wifi
                 cellularWeight > wifiWeight -> cellular
-                else -> pickNetwork()
+                else -> wifi
             }
         }
         return wifi ?: cellular
@@ -247,7 +233,13 @@ class BondingSocksServer(private val vpnService: VpnService) {
                 network = null
                 remote = AetherUpstream.openTcp(vpnService, destHost, destPort)
             } else {
-                val picked = pickNetwork() ?: throw IOException("No usable network")
+                // pickBestNetwork(), not pickNetwork(): this branch only ever carries Aether's
+                // own outbound connections (this server instance is Aether's dedicated
+                // upstreamProxy - see BigRocketVpnService/EmbeddedAetherRuntime), and a
+                // GOOL/TCP tunnel is one long-lived connection for the whole session, same as
+                // the UDP-associate case above - a single weighted-random sample would just as
+                // often pin the whole session to the low-weight path. See pickBestNetwork's doc.
+                val picked = pickBestNetwork() ?: throw IOException("No usable network")
                 network = picked
                 // Protecting a socket only prevents VPN recursion; it does NOT select the
                 // physical uplink. The selected Network must create/bind the socket, otherwise
@@ -337,8 +329,8 @@ class BondingSocksServer(private val vpnService: VpnService) {
         }
 
         // Single-path state for the real-dial (NONE-mode, aetherAssociation == null) branch:
-        // exactly one raw socket, bound once via the same weighted pickNetwork() the TCP
-        // CONNECT branch uses, for this association's entire lifetime.
+        // exactly one raw socket, bound once via the same deterministic pickBestNetwork() the
+        // TCP CONNECT branch uses, for this association's entire lifetime.
         //
         // This branch carries Aether's own WireGuard/GOOL tunnel (BondingSocksServer is
         // Aether's configured upstreamProxy - see EmbeddedAetherRuntime). An earlier version
