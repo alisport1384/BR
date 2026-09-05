@@ -350,7 +350,14 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             // BigRocket bonded transport, never a separate physical path.
             bondingUpstream = BondingSocksServer(this).also {
                 it.updateNetworks(wifiNetwork, cellularNetwork)
-                it.updateWeights(50, 50)
+                // Seeded with the engine's already-computed score-based weights (set two
+                // lines above by configureUserScores(), before any latency probing), not a
+                // hardcoded 50/50: BondingSocksServer pins Aether's single tunnel association
+                // to one path for its whole session the moment its first packet arrives, which
+                // can race startWeightUpdates()'s first probe cycle. A hardcoded 50/50 at that
+                // moment forces a tie, and a tie must never be settled by chance - see
+                // pickBestNetwork().
+                DynamicWeightCalculator.currentWeights().let { w -> it.updateWeights(w.wifiWeight, w.cellularWeight) }
                 it.setUpstreamMode(UpstreamMode.NONE)
                 it.start()
             }
