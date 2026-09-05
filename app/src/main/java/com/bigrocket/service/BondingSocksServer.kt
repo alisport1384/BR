@@ -141,6 +141,27 @@ class BondingSocksServer(private val vpnService: VpnService) {
         return wifi ?: cellular
     }
 
+    /** Deterministic best-path pick, used only for [handleUdpAssociate]'s single pinned
+     *  association (Aether's own tunnel: one long-lived flow for the whole VPN session, not
+     *  many short-lived ones). [pickNetwork]'s weighted-random split is correct for ordinary
+     *  traffic because it is sampled hundreds of times, so the outcome converges to the
+     *  configured ratio; sampled exactly once, it just as often lands on the low-weight path
+     *  outright and pins the entire tunnel there for the whole session. Picking the strictly
+     *  higher-weight network here removes that single-sample variance; ties fall back to
+     *  [pickNetwork] since either path is equally acceptable. */
+    private fun pickBestNetwork(): Network? {
+        val wifi = wifiNetwork
+        val cellular = cellularNetwork
+        if (wifi != null && cellular != null) {
+            return when {
+                wifiWeight > cellularWeight -> wifi
+                cellularWeight > wifiWeight -> cellular
+                else -> pickNetwork()
+            }
+        }
+        return wifi ?: cellular
+    }
+
     // --- SOCKS5 server handshake ------------------------------------------------------
 
     private suspend fun handleClient(client: Socket) {
@@ -418,7 +439,7 @@ class BondingSocksServer(private val vpnService: VpnService) {
                 }
 
                 if (pinnedSocket == null) {
-                    val network = pickNetwork() ?: continue // both paths down - drop, same as before
+                    val network = pickBestNetwork() ?: continue // both paths down - drop, same as before
                     val socket = bindPinnedSocket(network) ?: continue
                     pinnedSocket = socket
                     activeRelays[relayId]?.network = network
