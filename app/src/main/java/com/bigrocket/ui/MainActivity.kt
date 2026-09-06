@@ -51,6 +51,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var tvWifiStatus: TextView
     private lateinit var tvCellularStatus: TextView
+    private lateinit var tvPath3Status: TextView
     private lateinit var spinnerWifiScore: Spinner
     private lateinit var spinnerCellularScore: Spinner
     private lateinit var tvAiStatus: TextView
