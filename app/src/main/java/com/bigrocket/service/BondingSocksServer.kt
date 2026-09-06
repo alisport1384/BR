@@ -53,12 +53,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
     @Volatile private var cellularWeight = 50
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
-    // Randomized starting phase, not 0 - identical reasoning/fix to
-    // TunPacketRouter.packetCounter: starting at a fixed 0 made the very first new
-    // connection after every weight change/session start deterministically land on
-    // Wi-Fi whenever wifiWeight > 0, regardless of how low the configured share was
-    // (a single download is exactly one connection, so it always ran at Wi-Fi's speed).
-    private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt(100))
     private val relayIdCounter = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
@@ -102,10 +96,8 @@ class BondingSocksServer(private val vpnService: VpnService) {
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
-        val changed = wifiWeight != wifiW || cellularWeight != cellularW
         wifiWeight = wifiW
         cellularWeight = cellularW
-        if (changed) packetCounter.set(kotlin.random.Random.nextInt(100))
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -124,19 +116,34 @@ class BondingSocksServer(private val vpnService: VpnService) {
         }
     }
 
-    private fun pickNetwork(): Network? {
+    /** Deterministic best-path pick. This class has exactly one instance
+     *  (BigRocketVpnService.bondingUpstream), used exclusively as Aether's own upstreamProxy -
+     *  every connection/association it ever handles (TCP CONNECT for a GOOL/TCP tunnel, UDP
+     *  ASSOCIATE for a WireGuard/MASQUE tunnel) is one long-lived flow for the whole VPN
+     *  session, not one of many short-lived ones. A weighted-random sample is only meaningful
+     *  when it is drawn many times so the outcome converges to the configured ratio; drawn
+     *  exactly once, it just as often lands on the low-weight path outright and pins the
+     *  entire session there. This never uses chance:
+     *  unequal weights mean the app's own engine (DynamicWeightCalculator) has an authoritative
+     *  answer already (a user-set score difference, or a measured quality difference), so the
+     *  higher-weight network wins outright; an exact tie is resolved by that same engine's own
+     *  identity tie-break rule (recent measured latency - see preferredIdentityPath), not by a
+     *  fresh coin flip here. An exact tie only happens when the user has given both paths the
+     *  same score (unequal scores always produce unequal weights - see
+     *  DynamicWeightCalculator.preferredWeights), so it is rare and, either way, genuinely
+     *  arbitrary: Wi-Fi is picked, fixed and not random. (DynamicWeightCalculator's own
+     *  identity/IP tie-break is deliberately not reused here - it mutates a separate sticky
+     *  identity-owner state meant for a different feature, and calling it here would silently
+     *  decide/consume that state as a side effect of an unrelated bonding pin.) */
+    private fun pickBestNetwork(): Network? {
         val wifi = wifiNetwork
         val cellular = cellularNetwork
         if (wifi != null && cellular != null) {
-            // Real traffic ALWAYS uses the weighted split, unconditionally - never the identity
-            // policy. See the extended reasoning on TunPacketRouter.selectNetworkForPacket,
-            // which applies identically here: routing every new connection through identity for
-            // a time window pinned real downloads/uploads opened in roughly the first 5 seconds
-            // after connecting to Wi-Fi (identity's null-until-monitored fallback), regardless
-            // of score. Identity must never decide which physical network real traffic uses.
-            val count = packetCounter.getAndIncrement()
-            val slot = Math.floorMod(count, 100)
-            return if (slot < wifiWeight) wifi else cellular
+            return when {
+                wifiWeight > cellularWeight -> wifi
+                cellularWeight > wifiWeight -> cellular
+                else -> wifi
+            }
         }
         return wifi ?: cellular
     }
@@ -226,7 +233,13 @@ class BondingSocksServer(private val vpnService: VpnService) {
                 network = null
                 remote = AetherUpstream.openTcp(vpnService, destHost, destPort)
             } else {
-                val picked = pickNetwork() ?: throw IOException("No usable network")
+                // pickBestNetwork(), not pickNetwork(): this branch only ever carries Aether's
+                // own outbound connections (this server instance is Aether's dedicated
+                // upstreamProxy - see BigRocketVpnService/EmbeddedAetherRuntime), and a
+                // GOOL/TCP tunnel is one long-lived connection for the whole session, same as
+                // the UDP-associate case above - a single weighted-random sample would just as
+                // often pin the whole session to the low-weight path. See pickBestNetwork's doc.
+                val picked = pickBestNetwork() ?: throw IOException("No usable network")
                 network = picked
                 // Protecting a socket only prevents VPN recursion; it does NOT select the
                 // physical uplink. The selected Network must create/bind the socket, otherwise
@@ -315,17 +328,56 @@ class BondingSocksServer(private val vpnService: VpnService) {
             return
         }
 
-        // Per-destination direct sockets, only used when NOT chained through Aether (Aether's
-        // own UdpAssociation already multiplexes every destination over one association).
-        val directTargets = ConcurrentHashMap<String, Pair<DatagramSocket, Network>>()
-        var assignedNetwork: Network? = null
+        // Single-path state for the real-dial (NONE-mode, aetherAssociation == null) branch:
+        // exactly one raw socket, bound once via the same deterministic pickBestNetwork() the
+        // TCP CONNECT branch uses, for this association's entire lifetime.
+        //
+        // This branch carries Aether's own WireGuard/GOOL tunnel (BondingSocksServer is
+        // Aether's configured upstreamProxy - see EmbeddedAetherRuntime). An earlier version
+        // of this code alternated the source socket per outgoing packet on the theory that
+        // WireGuard tolerates roaming (it identifies a peer by session key, not source IP).
+        // That assumption is true for the CLIENT's outbound side but not for the resulting
+        // downlink: a roaming-capable peer sends ALL return traffic to whichever source
+        // address it most recently saw a valid packet from - a single "current endpoint",
+        // not both at once. Alternating the source every packet made the server's notion of
+        // "current endpoint" thrash on every packet, so the download direction (the bulk of
+        // any real transfer) collapsed onto whichever path happened to win that race - in
+        // practice mostly Wi-Fi - which is exactly the single-path-saturation symptom this
+        // was meant to fix. Pinning one physical path per association removes the thrash;
+        // weight is honored across associations/reconnects instead of within one, the same
+        // flow-level granularity already used everywhere else in this file and in
+        // TunPacketRouter.
+        var pinnedSocket: DatagramSocket? = null
+        var receiverJob: Job? = null
 
-        activeRelays[relayId] = ActiveRelay(null) {
-            runCatching { client.close() }
-            runCatching { localUdp.close() }
-            runCatching { aetherAssociation?.close() }
-            directTargets.values.forEach { (socket, _) -> runCatching { socket.close() } }
-        }
+        fun bindPinnedSocket(network: Network): DatagramSocket? = runCatching {
+            val s = DatagramSocket()
+            if (!vpnService.protect(s)) { s.close(); return@runCatching null }
+            network.bindSocket(s)
+            s.soTimeout = UDP_RECEIVE_TIMEOUT_MS
+            s
+        }.getOrNull()
+
+        fun startPinnedReceiver(socket: DatagramSocket, host: String, port: Int, clientAddr: InetSocketAddress): Job =
+            scope.launch {
+                val respBuf = ByteArray(64 * 1024)
+                try {
+                    while (isActive && !socket.isClosed) {
+                        val resp = DatagramPacket(respBuf, respBuf.size)
+                        try {
+                            socket.receive(resp)
+                        } catch (_: SocketTimeoutException) {
+                            continue
+                        } catch (_: Exception) {
+                            break
+                        }
+                        val encoded = encodeSocksUdp(host, port, resp.data.copyOf(resp.length))
+                        runCatching { localUdp.send(DatagramPacket(encoded, encoded.size, clientAddr)) }
+                        TrafficStats.recordBytes(resp.length)
+                    }
+                } catch (_: Exception) {
+                }
+            }
 
         // TUN ASSOCIATE lives for as long as the SOCKS5 control TCP connection stays open -
         // this small watcher just closes the UDP side (and unblocks the receive loop below)
@@ -338,6 +390,17 @@ class BondingSocksServer(private val vpnService: VpnService) {
             } finally {
                 runCatching { localUdp.close() }
             }
+        }
+
+        // Registered once the pinned path is known (first packet); a soft-failure on that
+        // specific Network then tears this association down like any single-path relay,
+        // letting the tunnel reconnect and get a fresh weighted pick on the surviving path.
+        activeRelays[relayId] = ActiveRelay(null) {
+            runCatching { client.close() }
+            runCatching { localUdp.close() }
+            runCatching { aetherAssociation?.close() }
+            runCatching { pinnedSocket?.close() }
+            receiverJob?.cancel()
         }
 
         val buffer = ByteArray(64 * 1024)
@@ -367,55 +430,27 @@ class BondingSocksServer(private val vpnService: VpnService) {
                     continue
                 }
 
-                val network = assignedNetwork ?: pickNetwork()?.also {
-                    assignedNetwork = it
-                    activeRelays[relayId]?.network = it
+                if (pinnedSocket == null) {
+                    val network = pickBestNetwork() ?: continue // both paths down - drop, same as before
+                    val socket = bindPinnedSocket(network) ?: continue
+                    pinnedSocket = socket
+                    activeRelays[relayId]?.network = network
+                    receiverJob = startPinnedReceiver(socket, decoded.host, decoded.port, fromAddr)
                 }
-                if (network == null) continue
-
-                val key = "${decoded.host}:${decoded.port}"
-                val (targetSocket, _) = directTargets.getOrPut(key) {
-                    val s = DatagramSocket()
-                    if (!vpnService.protect(s)) {
-                        s.close()
-                        throw IOException("Unable to protect UDP socket from VPN")
-                    }
-                    network.bindSocket(s)
-                    s.soTimeout = UDP_RECEIVE_TIMEOUT_MS
-                    s to network
-                }
+                val socket = pinnedSocket ?: continue
                 runCatching {
                     val dest = InetSocketAddress(InetAddress.getByName(decoded.host), decoded.port)
-                    targetSocket.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
+                    socket.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
                 }
                 TrafficStats.recordBytes(decoded.payload.size)
-
-                // Fire-and-forget response pump for this specific destination.
-                scope.launch {
-                    val respBuf = ByteArray(64 * 1024)
-                    try {
-                        while (isActive && !targetSocket.isClosed) {
-                            val resp = DatagramPacket(respBuf, respBuf.size)
-                            try {
-                                targetSocket.receive(resp)
-                            } catch (_: SocketTimeoutException) {
-                                if (System.currentTimeMillis() - lastActivity > UDP_IDLE_TIMEOUT_MS) break
-                                continue
-                            }
-                            val encoded = encodeSocksUdp(decoded.host, decoded.port, resp.data.copyOf(resp.length))
-                            runCatching { localUdp.send(DatagramPacket(encoded, encoded.size, fromAddr)) }
-                            TrafficStats.recordBytes(resp.length)
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
             }
         } finally {
             controlWatcher.cancel()
             activeRelays.remove(relayId)
             runCatching { localUdp.close() }
             runCatching { aetherAssociation?.close() }
-            directTargets.values.forEach { (socket, _) -> runCatching { socket.close() } }
+            runCatching { pinnedSocket?.close() }
+            receiverJob?.cancel()
             closeQuietly(client)
         }
     }
