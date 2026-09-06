@@ -73,6 +73,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     // Local SOCKS5 upstream for Aether: Aether's external transport is always
     // dialed through BigRocket's weighted physical-path bonding first.
     private var bondingUpstream: BondingSocksServer? = null
+    private val path3Router = Path3Router()
     private var networkMonitor: NetworkMonitor? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -177,7 +178,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 // hev refused to start (bad config/fd) - fall back to the JVM router with
                 // direct routing rather than leaving the tunnel with NO packet engine at all.
                 DiagnosticsLog.e("tunnel", "hev-socks5-tunnel failed to start, falling back to JVM router: ${e.message}")
-                packetRouter = TunPacketRouter(iface, this).also {
+                packetRouter = TunPacketRouter(iface, this, path3Router).also {
                     it.updateNetworks(wifiNetwork, cellularNetwork)
                     it.start()
                 }
@@ -187,7 +188,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             DiagnosticsLog.i("tunnel", "Switching TUN engine: native hev-socks5-tunnel -> JVM router")
             HevTunnel.stop()
             usingHevEngine = false
-            packetRouter = TunPacketRouter(iface, this).also {
+            packetRouter = TunPacketRouter(iface, this, path3Router).also {
                 it.updateNetworks(wifiNetwork, cellularNetwork)
                 it.start()
             }
@@ -343,10 +344,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             vpnInterface = establishedInterface
             isRunning = true
 
-            packetRouter = TunPacketRouter(establishedInterface, this).also {
+            packetRouter = TunPacketRouter(establishedInterface, this, path3Router).also {
                 it.updateWeights(50, 50)
                 it.start()
-                AppLogger.log("Direct", "TunPacketRouter started; MTU=1400")
+                AppLogger.log("Path3", "Direct output -> Path3")
             }
 
             // This listener is the physical-network boundary for Aether. Aether
@@ -354,7 +355,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             // relay to Wi-Fi/Cellular using the same bonding weights as the
             // direct BigRocket path. Aether is therefore downstream of the
             // BigRocket bonded transport, never a separate physical path.
-            bondingUpstream = BondingSocksServer(this).also {
+            bondingUpstream = BondingSocksServer(this, path3Router).also {
                 it.updateNetworks(wifiNetwork, cellularNetwork)
                 // Seeded with the engine's already-computed score-based weights (set two
                 // lines above by configureUserScores(), before any latency probing), not a
@@ -366,6 +367,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 DynamicWeightCalculator.currentWeights().let { w -> it.updateWeights(w.wifiWeight, w.cellularWeight) }
                 it.setUpstreamMode(UpstreamMode.NONE)
                 it.start()
+                AppLogger.log("Path3", "Aether input <- Path3 SOCKS")
             }
 
             // The monitor may have discovered the physical transports before establish().
@@ -394,6 +396,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         val oldCellular = cellularNetwork
         wifiNetwork = wifi
         cellularNetwork = cellular
+        path3Router.updateNetworks(wifi, cellular)
 
         if (wifi == null) wifiHealth.update(null, LatencyTester.FAILURE)
         if (cellular == null) cellularHealth.update(null, LatencyTester.FAILURE)
@@ -411,6 +414,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         when {
             wifi == null && cellular == null -> {
                 DynamicWeightCalculator.clear()
+                path3Router.updateWeights(0, 0)
                 packetRouter?.updateWeights(0, 0)
                 bondingUpstream?.updateWeights(0, 0)
             }
@@ -421,6 +425,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     cellularAvailable = cellular != null,
                     cellularLatency = 1
                 ).also {
+                    path3Router.updateWeights(it.wifiWeight, it.cellularWeight)
                     packetRouter?.updateWeights(it.wifiWeight, it.cellularWeight)
                     bondingUpstream?.updateWeights(it.wifiWeight, it.cellularWeight)
                 }
@@ -429,6 +434,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 val reset = DynamicWeightCalculator.resetForPathRecovery(
                     recoveredWifi = oldWifi == null || (wifi != null && oldWifi != wifi)
                 )
+                path3Router.updateWeights(reset.wifiWeight, reset.cellularWeight)
                 packetRouter?.updateWeights(reset.wifiWeight, reset.cellularWeight)
                 bondingUpstream?.updateWeights(reset.wifiWeight, reset.cellularWeight)
             }
@@ -550,6 +556,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     cellularLatency = effectiveCellularLatency.coerceAtLeast(1)
                 )
 
+                path3Router.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 packetRouter?.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 bondingUpstream?.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 packetRouter?.setUpstreamMode(
@@ -565,22 +572,16 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     else -> BondingMode.IDLE
                 }
                 val measuredMbps = Math.round(TrafficStats.sampleThroughputMbps() * 10) / 10.0
-
-                // Path 3 is the logical output of the two physical paths. Its displayed
-                // latency is the weight-adjusted latency of the currently usable paths.
-                // This is a quality estimate for the bonded output, not a second physical
-                // interface or an end-to-end ping.
                 val path3Connected = wifiOk || cellularOk
-                val path3LatencyMs = when {
-                    wifiOk && cellularOk -> {
-                        ((effectiveWifiLatency * weights.wifiWeight) +
-                            (effectiveCellularLatency * weights.cellularWeight)) /
-                            (weights.wifiWeight + weights.cellularWeight).coerceAtLeast(1)
-                    }
-                    wifiOk -> effectiveWifiLatency
-                    cellularOk -> effectiveCellularLatency
-                    else -> 0L
-                }.coerceAtLeast(0L)
+                val path3LatencyMs = path3Router.latencyMs(
+                    wifiLatencyMs = if (wifiOk) effectiveWifiLatency else 0,
+                    cellularLatencyMs = if (cellularOk) effectiveCellularLatency else 0
+                )
+                AppLogger.log(
+                    "Path3",
+                    "status=${if (path3Connected) "CONNECTED" else "DISCONNECTED"} latency=${path3LatencyMs}ms " +
+                        "wifi=${if (wifiOk) effectiveWifiLatency else "off"} cellular=${if (cellularOk) effectiveCellularLatency else "off"}"
+                )
 
                 BondingStatus.publish(
                     BondingSnapshot(
@@ -591,10 +592,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                         cellularLatencyMs = if (cellularOk) effectiveCellularLatency else 0,
                         wifiWeight = if (wifiOk) weights.wifiWeight else 0,
                         cellularWeight = if (cellularOk) weights.cellularWeight else 0,
-                        path3LatencyMs = path3LatencyMs,
-                        path3Connected = path3Connected,
                         mode = mode,
-                        bondedSpeedMbps = measuredMbps
+                        bondedSpeedMbps = measuredMbps,
+                        path3LatencyMs = path3LatencyMs,
+                        path3Connected = path3Connected
                     )
                 )
 

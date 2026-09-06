@@ -307,6 +307,12 @@ class MainActivity : AppCompatActivity() {
                 }
                 tvCellularStatus.text = cellularText
 
+                tvPath3Status.text = if (state.path3Connected) {
+                    "مسیر ۳: متصل (${state.path3LatencyMs}ms)"
+                } else {
+                    "مسیر ۳: قطع"
+                }
+
                 tvAiStatus.text = "وضعیت AI: ${state.mode.name}"
                 tvAiLog.text = when (state.mode) {
                     BondingMode.BONDING_ACTIVE ->
@@ -329,7 +335,7 @@ class MainActivity : AppCompatActivity() {
                 val displaySpeed = String.format(java.util.Locale.US, "%.1f", state.bondedSpeedMbps)
                 tvSpeed.text = "سرعت ترکیبی: $displaySpeed Mbps"
 
-isVpnRunning = state.isServiceActive
+                isVpnRunning = state.isServiceActive
                 if (isVpnRunning) {
                     if (upstreamChoice == UpstreamChoice.AETHER && !EmbeddedAetherRuntime.isRunning()) {
                         EmbeddedAetherRuntime.start(this@MainActivity, aetherProfile)
@@ -338,16 +344,7 @@ isVpnRunning = state.isServiceActive
                     if (EmbeddedAetherRuntime.isRunning()) EmbeddedAetherRuntime.stop(this@MainActivity)
                 }
                 btnToggleVpn.text = if (isVpnRunning) "قطع اتصال BigRocket" else "شروع اتصال BigRocket"
-                val path3Text = if (state.path3Connected) {
-                    "مسیر ۳ (خروجی Bonding): ${state.path3LatencyMs}ms - فعال"
-                } else {
-                    "مسیر ۳ (خروجی Bonding): قطع"
-                }
-                tvVpnStatus.text = if (isVpnRunning) {
-                    "وضعیت اتصال: ${if (state.path3Connected) "VPN فعال" else "VPN فعال - مسیر ۳ قطع"}\n$path3Text"
-                } else {
-                    "وضعیت اتصال: غیرفعال"
-                }
+                tvVpnStatus.text = if (isVpnRunning) "وضعیت اتصال: VPN فعال" else "وضعیت اتصال: غیرفعال"
                 tvBarLegend.text = "Wi-Fi ${state.wifiWeight}% · Cellular ${state.cellularWeight}%"
 
                 // Cheap split-bar update: just change layout weights, no custom drawing.

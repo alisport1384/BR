@@ -18,10 +18,10 @@ data class BondingSnapshot(
     val cellularLatencyMs: Long = 0,
     val wifiWeight: Int = 0,
     val cellularWeight: Int = 0,
-    val path3LatencyMs: Long = 0,
-    val path3Connected: Boolean = false,
     val mode: BondingMode = BondingMode.IDLE,
-    val bondedSpeedMbps: Double = 0.0
+    val bondedSpeedMbps: Double = 0.0,
+    val path3LatencyMs: Long = 0,
+    val path3Connected: Boolean = false
 )
 
 /**

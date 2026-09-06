@@ -14,7 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class TunPacketRouter(
     private val vpnInterface: ParcelFileDescriptor,
-    private val vpnService: BigRocketVpnService
+    private val vpnService: BigRocketVpnService,
+    private val path3Router: Path3Router
 ) {
 
     // SupervisorJob: see the identical comment in TcpRelayEngine.kt. routerJob (the
@@ -46,6 +47,7 @@ class TunPacketRouter(
 
         this.wifiNetwork = wifi
         this.cellularNetwork = cellular
+        path3Router.updateNetworks(wifi, cellular)
 
         if (oldWifi != null && wifi == null) {
             notifyNetworkLost(oldWifi)
@@ -96,6 +98,7 @@ class TunPacketRouter(
         val changed = this.wifiWeight != wifiW || this.cellularWeight != cellularW
         this.wifiWeight = wifiW
         this.cellularWeight = cellularW
+        path3Router.updateWeights(wifiW, cellularW)
         if (changed) packetCounter.set(kotlin.random.Random.nextInt(100))
     }
 
@@ -125,10 +128,8 @@ class TunPacketRouter(
                             processAndRoutePacket(packet, buffer, readBytes, outputStream)
                         }
                     }
-                } catch (e: Exception) {
-                    // Keep the TUN reader alive, but expose the actual direct-mode failure in
-                    // the user-exportable diagnostic log instead of silently swallowing it.
-                    AppLogger.logError("Direct-TUN", "packet processing failed", e)
+                } catch (_: Exception) {
+                    // Transient error on the TUN interface; keep reading
                 } finally {
                     buffer.clear()
                 }
@@ -171,29 +172,7 @@ class TunPacketRouter(
         }
     }
 
-    private fun selectNetworkForPacket(): Network? {
-        val wifi = wifiNetwork
-        val cellular = cellularNetwork
-
-        if (wifi != null && cellular != null) {
-            // Real traffic ALWAYS uses the weighted split, unconditionally - never the identity
-            // policy. An earlier version routed every new connection through
-            // DynamicWeightCalculator.preferredIdentityPath() for a time window after
-            // connecting, meant only to make a manual "what is my IP" check reflect the user's
-            // score. That leaked into real traffic too: preferredIdentityPath() returns null
-            // until ~5s of latency samples exist, and the window's fallback for null defaulted
-            // to Wi-Fi - so any download/upload connection opened in roughly the first 5
-            // seconds after connecting (a very common case: connect, then immediately start a
-            // transfer) was pinned to Wi-Fi for its entire lifetime regardless of score. Identity
-            // is a separate, opt-in query (see preferredIdentityPath's own callers) and must
-            // never again decide which physical network real traffic uses.
-            val count = packetCounter.getAndIncrement()
-            val slot = Math.floorMod(count, 100)
-            return if (slot < wifiWeight) wifi else cellular
-        }
-
-        return wifi ?: cellular
-    }
+    private fun selectNetworkForPacket(): Network? = path3Router.selectNetwork(packetCounter.getAndIncrement())
 
     fun stop() {
         isRunning = false

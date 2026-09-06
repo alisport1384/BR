@@ -37,7 +37,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * Kept as a self-contained alternate path (TunPacketRouter is untouched) specifically so
  * this can be A/B compared and trivially reverted - see BigRocketVpnService.USE_HEV_TUNNEL.
  */
-class BondingSocksServer(private val vpnService: VpnService) {
+class BondingSocksServer(
+    private val vpnService: VpnService,
+    private val path3Router: Path3Router
+) {
 
     companion object {
         /** 127.0.0.1-only; picked to avoid AetherUpstream's own 1819 and any other local port. */
@@ -47,8 +50,6 @@ class BondingSocksServer(private val vpnService: VpnService) {
         private const val UDP_RECEIVE_TIMEOUT_MS = 1000
     }
 
-    @Volatile private var wifiNetwork: Network? = null
-    @Volatile private var cellularNetwork: Network? = null
     @Volatile private var wifiWeight = 50
     @Volatile private var cellularWeight = 50
     @Volatile private var upstreamMode = UpstreamMode.NONE
@@ -91,13 +92,13 @@ class BondingSocksServer(private val vpnService: VpnService) {
     }
 
     fun updateNetworks(wifi: Network?, cellular: Network?) {
-        wifiNetwork = wifi
-        cellularNetwork = cellular
+        path3Router.updateNetworks(wifi, cellular)
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
         wifiWeight = wifiW
         cellularWeight = cellularW
+        path3Router.updateWeights(wifiW, cellularW)
     }
 
     fun setUpstreamMode(mode: UpstreamMode) {
@@ -135,18 +136,7 @@ class BondingSocksServer(private val vpnService: VpnService) {
      *  identity/IP tie-break is deliberately not reused here - it mutates a separate sticky
      *  identity-owner state meant for a different feature, and calling it here would silently
      *  decide/consume that state as a side effect of an unrelated bonding pin.) */
-    private fun pickBestNetwork(): Network? {
-        val wifi = wifiNetwork
-        val cellular = cellularNetwork
-        if (wifi != null && cellular != null) {
-            return when {
-                wifiWeight > cellularWeight -> wifi
-                cellularWeight > wifiWeight -> cellular
-                else -> wifi
-            }
-        }
-        return wifi ?: cellular
-    }
+    private fun pickBestNetwork(): Network? = path3Router.selectNetwork()
 
     // --- SOCKS5 server handshake ------------------------------------------------------
 
