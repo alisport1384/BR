@@ -136,6 +136,7 @@ class MainActivity : AppCompatActivity() {
         toolbar = findViewById(R.id.toolbar)
         tvWifiStatus = findViewById(R.id.tvWifiStatus)
         tvCellularStatus = findViewById(R.id.tvCellularStatus)
+        tvPath3Status = findViewById(R.id.tvPath3Status)
         spinnerWifiScore = findViewById(R.id.spinnerWifiScore)
         spinnerCellularScore = findViewById(R.id.spinnerCellularScore)
         setupNetworkScoreControls()
