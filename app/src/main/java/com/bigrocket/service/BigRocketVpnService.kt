@@ -120,6 +120,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
     override fun onCreate() {
         super.onCreate()
+        AppLogger.init(this)
+        AppLogger.log("VpnService", "onCreate()")
         createNotificationChannel()
 
         // Apply the active embedded proxy's readiness to the router the moment it changes,
@@ -200,10 +202,12 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // can kill us with "did not then call Service.startForeground()".
         try {
             startForegroundCompat()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            AppLogger.logError("VpnService", "startForegroundCompat() failed, stopping self", e)
             stopSelf()
             return START_NOT_STICKY
         }
+        AppLogger.log("VpnService", "onStartCommand action=${intent?.action}")
 
         if (intent?.action == ACTION_STOP) {
             serviceScope.launch { controlMutex.withLock { stopVpn() } }
@@ -331,6 +335,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
             val establishedInterface = builder.establish()
             if (establishedInterface == null) {
+                AppLogger.log("VpnService", "builder.establish() returned null - VPN permission revoked or another VPN took over")
                 stopVpn()
                 return
             }
@@ -376,7 +381,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
             TrafficStats.reset()
             startWeightUpdates()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            AppLogger.logError("VpnService", "setupVpn() failed, tearing down", e)
             stopVpn()
         }
     }
@@ -601,6 +607,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     }
 
     private fun stopVpn() {
+        AppLogger.log("VpnService", "stopVpn()")
         isRunning = false
 
         weightUpdateJob?.cancel()

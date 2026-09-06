@@ -9,15 +9,19 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.Menu
+import android.view.MenuItem
 import android.widget.Button
 import android.widget.Spinner
 import android.widget.ArrayAdapter
 import android.widget.AdapterView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.ui.platform.ComposeView
@@ -32,6 +36,7 @@ import studio.cluvex.aether.model.ConnectionProfile
 import com.bigrocket.service.EmbeddedAetherRuntime
 import com.bigrocket.service.DynamicWeightCalculator
 import com.bigrocket.service.NetworkPreferenceStore
+import com.bigrocket.service.AppLogger
 import com.bigrocket.R
 import com.bigrocket.service.BigRocketVpnService
 import com.bigrocket.service.BondingMode
@@ -61,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvAetherMode: TextView
     private lateinit var spinnerAetherMode: Spinner
     private lateinit var aetherEmbeddedPanel: ComposeView
+    private lateinit var toolbar: Toolbar
     private var upstreamChoice = UpstreamChoice.NONE
     // Backed by Compose state (not a plain var): AetherEmbeddedPanel reads this inside
     // aetherEmbeddedPanel.setContent{}, so a plain var mutation here was invisible to Compose -
@@ -90,11 +96,27 @@ class MainActivity : AppCompatActivity() {
         proceedToVpnPermissionCheck()
     }
 
+    private val saveLogLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult // user cancelled the picker
+        try {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                out.write(AppLogger.exportText().toByteArray())
+            }
+            Toast.makeText(this, "لاگ ذخیره شد", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "ذخیره لاگ ناموفق بود: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        AppLogger.init(this)
         initViews()
+        setSupportActionBar(toolbar)
         setupUpstreamIntegration()
 
         btnToggleVpn.setOnClickListener {
@@ -110,6 +132,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initViews() {
+        toolbar = findViewById(R.id.toolbar)
         tvWifiStatus = findViewById(R.id.tvWifiStatus)
         tvCellularStatus = findViewById(R.id.tvCellularStatus)
         spinnerWifiScore = findViewById(R.id.spinnerWifiScore)
@@ -241,6 +264,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun setUpstreamChoice(choice: UpstreamChoice) {
         if (upstreamChoice == choice) return
+        AppLogger.log("Upstream", "switching $upstreamChoice -> $choice")
         upstreamChoice = choice
         renderUpstreamChoice()
 
@@ -371,6 +395,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
+        AppLogger.log("VPN", "startVpnService() called, upstreamChoice=$upstreamChoice")
         val intent = Intent(this, BigRocketVpnService::class.java)
         ContextCompat.startForegroundService(this, intent)
 
@@ -379,7 +404,45 @@ class MainActivity : AppCompatActivity() {
         tvVpnStatus.text = "وضعیت اتصال: VPN فعال"
     }
 
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
+        // Reflects AppLogger's true current state every time the menu opens, rather than
+        // trusting whatever the item's checked state happened to be left at - matters after a
+        // process restart, since the menu view itself doesn't survive that but the underlying
+        // preference does.
+        menu.findItem(R.id.action_toggle_logging)?.isChecked = AppLogger.isEnabled()
+        return super.onPrepareOptionsMenu(menu)
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.action_toggle_logging -> {
+                val newValue = !item.isChecked
+                item.isChecked = newValue
+                AppLogger.setEnabled(this, newValue)
+                Toast.makeText(
+                    this,
+                    if (newValue) "ثبت لاگ فعال شد" else "ثبت لاگ غیرفعال شد",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                true
+            }
+            R.id.action_save_log -> {
+                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                    .format(java.util.Date())
+                saveLogLauncher.launch("bigrocket_log_$timestamp.txt")
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
+    }
+
     private fun stopVpnService() {
+        AppLogger.log("VPN", "stopVpnService() called")
         EmbeddedAetherRuntime.stop(this)
         val intent = Intent(this, BigRocketVpnService::class.java).apply {
             action = BigRocketVpnService.ACTION_STOP
