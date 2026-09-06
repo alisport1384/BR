@@ -250,7 +250,12 @@ class TcpRelayEngine(
                 val job = launch { listenForTcpResponses(key, session, tunOutputStream) }
                 socketJobs[key] = job
                 writerJobs[key] = launch { runSocketWriter(key, session, tunOutputStream) }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                AppLogger.logError(
+                    "Direct-TCP",
+                    "openSession failed ${key.destinationIp}:${key.destinationPort}",
+                    e
+                )
                 try {
                     val rst = IpPacketBuilder.buildTcpResponsePacket(
                         srcIp = key.destinationIp,

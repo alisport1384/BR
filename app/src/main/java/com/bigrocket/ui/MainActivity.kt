@@ -329,7 +329,7 @@ class MainActivity : AppCompatActivity() {
                 val displaySpeed = String.format(java.util.Locale.US, "%.1f", state.bondedSpeedMbps)
                 tvSpeed.text = "سرعت ترکیبی: $displaySpeed Mbps"
 
-                isVpnRunning = state.isServiceActive
+isVpnRunning = state.isServiceActive
                 if (isVpnRunning) {
                     if (upstreamChoice == UpstreamChoice.AETHER && !EmbeddedAetherRuntime.isRunning()) {
                         EmbeddedAetherRuntime.start(this@MainActivity, aetherProfile)
@@ -338,7 +338,16 @@ class MainActivity : AppCompatActivity() {
                     if (EmbeddedAetherRuntime.isRunning()) EmbeddedAetherRuntime.stop(this@MainActivity)
                 }
                 btnToggleVpn.text = if (isVpnRunning) "قطع اتصال BigRocket" else "شروع اتصال BigRocket"
-                tvVpnStatus.text = if (isVpnRunning) "وضعیت اتصال: VPN فعال" else "وضعیت اتصال: غیرفعال"
+                val path3Text = if (state.path3Connected) {
+                    "مسیر ۳ (خروجی Bonding): ${state.path3LatencyMs}ms - فعال"
+                } else {
+                    "مسیر ۳ (خروجی Bonding): قطع"
+                }
+                tvVpnStatus.text = if (isVpnRunning) {
+                    "وضعیت اتصال: ${if (state.path3Connected) "VPN فعال" else "VPN فعال - مسیر ۳ قطع"}\n$path3Text"
+                } else {
+                    "وضعیت اتصال: غیرفعال"
+                }
                 tvBarLegend.text = "Wi-Fi ${state.wifiWeight}% · Cellular ${state.cellularWeight}%"
 
                 // Cheap split-bar update: just change layout weights, no custom drawing.

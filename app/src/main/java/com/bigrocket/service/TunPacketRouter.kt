@@ -125,8 +125,10 @@ class TunPacketRouter(
                             processAndRoutePacket(packet, buffer, readBytes, outputStream)
                         }
                     }
-                } catch (_: Exception) {
-                    // Transient error on the TUN interface; keep reading
+                } catch (e: Exception) {
+                    // Keep the TUN reader alive, but expose the actual direct-mode failure in
+                    // the user-exportable diagnostic log instead of silently swallowing it.
+                    AppLogger.logError("Direct-TUN", "packet processing failed", e)
                 } finally {
                     buffer.clear()
                 }

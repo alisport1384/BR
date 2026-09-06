@@ -325,7 +325,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
-                .setMtu(1280)
+                .setMtu(1400)
 
             try {
                 builder.addDisallowedApplication(packageName)
@@ -346,6 +346,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             packetRouter = TunPacketRouter(establishedInterface, this).also {
                 it.updateWeights(50, 50)
                 it.start()
+                AppLogger.log("Direct", "TunPacketRouter started; MTU=1400")
             }
 
             // This listener is the physical-network boundary for Aether. Aether
@@ -565,6 +566,22 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 }
                 val measuredMbps = Math.round(TrafficStats.sampleThroughputMbps() * 10) / 10.0
 
+                // Path 3 is the logical output of the two physical paths. Its displayed
+                // latency is the weight-adjusted latency of the currently usable paths.
+                // This is a quality estimate for the bonded output, not a second physical
+                // interface or an end-to-end ping.
+                val path3Connected = wifiOk || cellularOk
+                val path3LatencyMs = when {
+                    wifiOk && cellularOk -> {
+                        ((effectiveWifiLatency * weights.wifiWeight) +
+                            (effectiveCellularLatency * weights.cellularWeight)) /
+                            (weights.wifiWeight + weights.cellularWeight).coerceAtLeast(1)
+                    }
+                    wifiOk -> effectiveWifiLatency
+                    cellularOk -> effectiveCellularLatency
+                    else -> 0L
+                }.coerceAtLeast(0L)
+
                 BondingStatus.publish(
                     BondingSnapshot(
                         isServiceActive = true,
@@ -574,6 +591,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                         cellularLatencyMs = if (cellularOk) effectiveCellularLatency else 0,
                         wifiWeight = if (wifiOk) weights.wifiWeight else 0,
                         cellularWeight = if (cellularOk) weights.cellularWeight else 0,
+                        path3LatencyMs = path3LatencyMs,
+                        path3Connected = path3Connected,
                         mode = mode,
                         bondedSpeedMbps = measuredMbps
                     )

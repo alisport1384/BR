@@ -108,7 +108,12 @@ class UdpRelayEngine(
                 }
                 TrafficStats.recordBytes(payloadSize)
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            AppLogger.logError(
+                "Direct-UDP",
+                "forward failed ${key.destinationIp}:${key.destinationPort}",
+                e
+            )
             closeSession(key)
         }
     }
