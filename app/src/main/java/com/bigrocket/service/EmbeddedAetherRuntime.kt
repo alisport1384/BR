@@ -48,6 +48,21 @@ object EmbeddedAetherRuntime {
                     upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
                 )
                 ProfileStore(app).save(embeddedProfile)
+                // The embedded runtime has its own AetherProcess lifecycle and
+                // does not pass through AetherVpnService.connectAttempt(). A
+                // previous engine can therefore still own 127.0.0.1:1819 when
+                // an update/reconnect starts this path again. Never launch a
+                // second native engine while that listener is still present.
+                stopInternal()
+                val portReleased = PortProbe.awaitClosed(
+                    TunnelConfig.SOCKS_HOST,
+                    TunnelConfig.SOCKS_PORT,
+                    PORT_RELEASE_WAIT_MS,
+                )
+                if (!portReleased) {
+                    error("Aether SOCKS5 port ${TunnelConfig.SOCKS_PORT} is still busy")
+                }
+
                 val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
                 process = engine
                 engine.start(embeddedProfile)
@@ -101,4 +116,6 @@ object EmbeddedAetherRuntime {
     fun isRunning(): Boolean = process?.isAlive() == true
 
     fun isTrafficReady(): Boolean = _trafficReady.value
+
+    private const val PORT_RELEASE_WAIT_MS = 3_000L
 }
