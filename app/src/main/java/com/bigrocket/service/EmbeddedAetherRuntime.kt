@@ -37,7 +37,7 @@ object EmbeddedAetherRuntime {
         _trafficReady.value = false
         val app = context.applicationContext
         job = scope.launch {
-            try {
+            runCatching {
                 AetherController.setState(ConnectionState.Launching)
                 EngineMeta.reset()
                 // Aether must consume BigRocket's already-bonded transport. Its own
@@ -48,16 +48,6 @@ object EmbeddedAetherRuntime {
                     upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
                 )
                 ProfileStore(app).save(embeddedProfile)
-                // A previous Aether instance can still be in the kernel teardown window
-                // after disconnect. Never launch a new instance while its SOCKS listener
-                // may still own 1819; otherwise the new engine can fail its bind and the
-                // readiness probe reports the generic listener error.
-                PortProbe.awaitClosed(
-                    TunnelConfig.SOCKS_HOST,
-                    TunnelConfig.SOCKS_PORT,
-                    PORT_RELEASE_WAIT_MS,
-                )
-
                 val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
                 process = engine
                 engine.start(embeddedProfile)
@@ -84,11 +74,11 @@ object EmbeddedAetherRuntime {
                 AetherController.setIpLoading(false)
                 AetherController.setState(ConnectionState.Connected("${TunnelConfig.SOCKS_HOST}:${TunnelConfig.SOCKS_PORT}"))
                 _trafficReady.value = true
-            } catch (t: Throwable) {
-                AetherController.setState(ConnectionState.Error(t.message ?: "Aether connection failed"))
+            }.onFailure {
+                AetherController.setState(ConnectionState.Error(it.message ?: "Aether connection failed"))
                 _enabled.value = false
                 _trafficReady.value = false
-                stopInternalAndAwaitClosed()
+                stopInternal()
             }
         }
     }
@@ -103,16 +93,6 @@ object EmbeddedAetherRuntime {
         EngineMeta.reset()
     }
 
-    private suspend fun stopInternalAndAwaitClosed() {
-        runCatching { process?.stop() }
-        process = null
-        PortProbe.awaitClosed(
-            TunnelConfig.SOCKS_HOST,
-            TunnelConfig.SOCKS_PORT,
-            PORT_RELEASE_WAIT_MS,
-        )
-    }
-
     private fun stopInternal() {
         runCatching { process?.stop() }
         process = null
@@ -121,6 +101,4 @@ object EmbeddedAetherRuntime {
     fun isRunning(): Boolean = process?.isAlive() == true
 
     fun isTrafficReady(): Boolean = _trafficReady.value
-
-    private const val PORT_RELEASE_WAIT_MS = 5_000L
 }

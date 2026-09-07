@@ -308,15 +308,8 @@ data class ConnectionProfile(
         // HTTP/2 over TCP whenever the user chained the engine behind an
         // http:// proxy. Forcing it here turns "connects but nothing loads"
         // into a working session the user never has to debug.
-        // BigRocket's local SOCKS5 Path3 boundary carries TCP CONNECT reliably.
-        // Do not let MASQUE select HTTP/3/QUIC when an upstream proxy is configured:
-        // QUIC would require SOCKS5 UDP ASSOCIATE through the local bridge during
-        // startup validation, which can keep Aether from ever exposing its SOCKS5
-        // listener. HTTP/2 keeps the entire MASQUE transport on one TCP SOCKS5
-        // CONNECT and preserves the Path3 routing boundary.
-        val hasUpstream = sanitizedUpstream() != null
         val httpUpstream = sanitizedUpstream()?.startsWith("http://") == true
-        put("AETHER_MASQUE_HTTP2", if (masqueHttp2 || hasUpstream || httpUpstream) "1" else "0")
+        put("AETHER_MASQUE_HTTP2", if (masqueHttp2 || httpUpstream) "1" else "0")
 
         // Which addresses the engine's scanner may consider.
         //

@@ -239,11 +239,7 @@ class BondingSocksServer(
                 // physical uplink. The selected Network must create/bind the socket, otherwise
                 // Android is free to use the default network (typically Wi-Fi), defeating
                 // BigRocket's path selection.
-                val socket = networkSocket(picked)
-                if (!vpnService.protect(socket)) throw IOException("Unable to protect TCP socket from VPN")
-                socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(destHost, destPort), CONNECT_TIMEOUT_MS)
-                remote = socket
+                remote = connectOnNetwork(picked, destHost, destPort)
             }
         } catch (_: Exception) {
             runCatching { clientOut.write(socksReply(0x01)); clientOut.flush() }
@@ -281,6 +277,40 @@ class BondingSocksServer(
 
     private fun networkSocket(network: Network): Socket =
         network.socketFactory.createSocket()
+
+    /** Resolve and connect entirely on the selected physical Android Network. */
+    private fun connectOnNetwork(network: Network, host: String, port: Int): Socket {
+        val addresses = try {
+            network.getAllByName(host)
+        } catch (e: Exception) {
+            throw IOException("DNS failed on selected network for $host: ${e.message}", e)
+        }
+
+        if (addresses.isEmpty()) {
+            throw IOException("No addresses resolved on selected network for $host")
+        }
+
+        var lastError: Exception? = null
+        for (address in addresses) {
+            val socket = networkSocket(network)
+            try {
+                if (!vpnService.protect(socket)) {
+                    throw IOException("Unable to protect TCP socket from VPN")
+                }
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+                return socket
+            } catch (e: Exception) {
+                lastError = e
+                runCatching { socket.close() }
+            }
+        }
+
+        throw IOException(
+            "TCP connect failed on selected network for $host:$port: ${lastError?.message}",
+            lastError,
+        )
+    }
 
     private fun pipe(from: InputStream, to: OutputStream) {
         val buffer = ByteArray(16 * 1024)
