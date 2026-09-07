@@ -2,8 +2,8 @@
 
 ![Aether](Docs/Aether.png)
 
-### اینترنت آزاد برای همه :))
-**[راهنمای فارسی](README.fa.md)** · **[English Guide](Docs/GUIDE.en.md)** · **[راهنمای کامل فارسی](Docs/GUIDE.fa.md)**
+### اینترنت آزاد برای همه:))
+**[راهنمای فارسی](README.fa.md)** · **[English Guide](Docs/DOCS.en.md)** · **[راهنمای کامل فارسی](Docs/DOCS.fa.md)**
 
 Telegram: https://t.me/CluvexStudio
 
@@ -16,8 +16,10 @@ Unlike traditional VPN clients, Aether is built for environments where Deep Pack
 - Automatic endpoint discovery, with end-to-end data-plane validation so a gateway is only trusted once it actually passes traffic, not just once it answers the handshake
 - MASQUE (HTTP/3 & HTTP/2), with optional TLS ClientHello fragmentation on HTTP/2
 - WireGuard support
-- Nested WireGuard mode (`gool`)
+- Nested WireGuard mode (`gool`), with both hops discovered by the scan or given by hand
 - Traffic obfuscation
+- Routing rules by domain, address, or port, matched from the TLS server name so they keep working behind a tun front end
+- Upstream proxy support, so Aether can dial out through another VPN or proxy already running on the machine
 - Automatic reconnection, and quick-reconnect to your last known-good gateway to skip rescanning
 - Local SOCKS5 proxy
 - Command-line flags, environment variables, or interactive prompts — your choice
@@ -50,7 +52,7 @@ To update later, run `./aether.sh update`. To remove it, run `./aether.sh uninst
 
 ### Requirements
 
-- Rust (latest stable)
+- Rust 1.91 or newer
 - C/C++ compiler
 - CMake
 
@@ -78,16 +80,20 @@ target/release/aether
 
 You can run Aether in an isolated environment using Docker. The official image is available on GitHub Container Registry (GHCR).
 
+> **The SOCKS5 proxy has no authentication.** Anyone who can reach the port can use your tunnel. Every command below publishes the port to `127.0.0.1` only, so it stays reachable from your own machine and nothing else. Do not replace it with `-p 1819:1819`, because that form listens on every interface of the host and turns the proxy into an open relay. If you genuinely need to serve other machines, put an authenticated front end in front of it and firewall the port.
+
+The `-v aether-data:/data` volume keeps the generated WARP identity between runs. Without it every start registers a brand new device, and Cloudflare begins rate limiting your address.
+
 Pull and run the pre-built image (interactive mode is required for initial setup):
 
 ```bash
-docker run -it -p 1819:1819 ghcr.io/cluvexstudio/aether:latest
+docker run -it -p 127.0.0.1:1819:1819 -v aether-data:/data ghcr.io/cluvexstudio/aether:latest
 ```
 
 You can also bypass prompts by providing environment variables:
 
 ```bash
-docker run -it -p 1819:1819 \
+docker run -it -p 127.0.0.1:1819:1819 -v aether-data:/data \
   -e AETHER_PROTOCOL=masque \
   -e AETHER_SCAN=balanced \
   ghcr.io/cluvexstudio/aether:latest
@@ -97,7 +103,7 @@ If you prefer to build the image manually from source:
 
 ```bash
 docker build -t aether .
-docker run -it -p 1819:1819 aether
+docker run -it -p 127.0.0.1:1819:1819 -v aether-data:/data aether
 ```
 
 ## Usage
@@ -116,7 +122,7 @@ Or skip the prompts with flags:
 
 On Windows, double-click `run-aether.bat` (included in the release zip) instead — it opens a terminal, runs `aether.exe`, and keeps the window open afterwards so you can read any errors.
 
-Every prompt has a flag and an environment variable equivalent. Run `./target/release/aether --help` for the full list, or see the guides linked below.
+Every prompt has a flag and an environment variable equivalent. Run `aether help` (or `--help`) for the full list — every flag, every variable, and what each one does — or see the guides linked below.
 
 After startup, a SOCKS5 proxy will be available at:
 
@@ -143,6 +149,8 @@ Fast and lightweight transport for networks with less aggressive inspection.
 ### Nested WireGuard (`gool`)
 
 A WireGuard tunnel running inside another WireGuard tunnel, providing an additional encryption layer.
+
+Its two hops are found by the scan by default. If you already know addresses that work on your network, name them instead with `--wiw-outer 162.159.192.1:2408 --wiw-inner 188.114.96.1:2408`, or both at once with `--wiw-peers 162.159.192.1:2408,188.114.96.1:2408`. The port is required — which port gets through is what differs between networks, so none is assumed. Give only one and the scan finds the other.
 
 ## Documentation
 
