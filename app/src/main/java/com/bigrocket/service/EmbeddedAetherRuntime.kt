@@ -37,7 +37,7 @@ object EmbeddedAetherRuntime {
         _trafficReady.value = false
         val app = context.applicationContext
         job = scope.launch {
-            runCatching {
+            try {
                 AetherController.setState(ConnectionState.Launching)
                 EngineMeta.reset()
                 // Aether must consume BigRocket's already-bonded transport. Its own
@@ -48,20 +48,15 @@ object EmbeddedAetherRuntime {
                     upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
                 )
                 ProfileStore(app).save(embeddedProfile)
-                // The embedded runtime has its own AetherProcess lifecycle and
-                // does not pass through AetherVpnService.connectAttempt(). A
-                // previous engine can therefore still own 127.0.0.1:1819 when
-                // an update/reconnect starts this path again. Never launch a
-                // second native engine while that listener is still present.
-                stopInternal()
-                val portReleased = PortProbe.awaitClosed(
+                // A previous Aether instance can still be in the kernel teardown window
+                // after disconnect. Never launch a new instance while its SOCKS listener
+                // may still own 1819; otherwise the new engine can fail its bind and the
+                // readiness probe reports the generic listener error.
+                PortProbe.awaitClosed(
                     TunnelConfig.SOCKS_HOST,
                     TunnelConfig.SOCKS_PORT,
                     PORT_RELEASE_WAIT_MS,
                 )
-                if (!portReleased) {
-                    error("Aether SOCKS5 port ${TunnelConfig.SOCKS_PORT} is still busy")
-                }
 
                 val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
                 process = engine
@@ -89,11 +84,11 @@ object EmbeddedAetherRuntime {
                 AetherController.setIpLoading(false)
                 AetherController.setState(ConnectionState.Connected("${TunnelConfig.SOCKS_HOST}:${TunnelConfig.SOCKS_PORT}"))
                 _trafficReady.value = true
-            }.onFailure {
-                AetherController.setState(ConnectionState.Error(it.message ?: "Aether connection failed"))
+            } catch (t: Throwable) {
+                AetherController.setState(ConnectionState.Error(t.message ?: "Aether connection failed"))
                 _enabled.value = false
                 _trafficReady.value = false
-                stopInternal()
+                stopInternalAndAwaitClosed()
             }
         }
     }
@@ -108,6 +103,16 @@ object EmbeddedAetherRuntime {
         EngineMeta.reset()
     }
 
+    private suspend fun stopInternalAndAwaitClosed() {
+        runCatching { process?.stop() }
+        process = null
+        PortProbe.awaitClosed(
+            TunnelConfig.SOCKS_HOST,
+            TunnelConfig.SOCKS_PORT,
+            PORT_RELEASE_WAIT_MS,
+        )
+    }
+
     private fun stopInternal() {
         runCatching { process?.stop() }
         process = null
@@ -117,5 +122,5 @@ object EmbeddedAetherRuntime {
 
     fun isTrafficReady(): Boolean = _trafficReady.value
 
-    private const val PORT_RELEASE_WAIT_MS = 3_000L
+    private const val PORT_RELEASE_WAIT_MS = 5_000L
 }
