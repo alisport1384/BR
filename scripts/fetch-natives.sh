@@ -41,7 +41,13 @@ clone_repo_exact() {
 }
 
 echo "==> Fetching hev-socks5-tunnel (tunnel core)"
-clone_repo "${GH}/${HEV_REPO}.git" "${HEV_DIR}" "${HEV_REF}"
+if [ -n "${HEV_REF}" ]; then
+  clone_repo_exact "${GH}/${HEV_REPO}.git" "${HEV_DIR}" "${HEV_REF}"
+else
+  rm -rf "${HEV_DIR}"
+  git clone --depth 1 --recursive "${GH}/${HEV_REPO}.git" "${HEV_DIR}"
+  echo "   cloned ${GH}/${HEV_REPO}.git @ default"
+fi
 if [ ! -f "${HEV_DIR}/Makefile" ]; then
   echo "ERROR: hev-socks5-tunnel checkout has no Makefile at ${HEV_DIR}" >&2
   ls -la "${HEV_DIR}" >&2 || true
