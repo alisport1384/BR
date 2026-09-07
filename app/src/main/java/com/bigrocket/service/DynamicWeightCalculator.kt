@@ -58,6 +58,10 @@ object DynamicWeightCalculator {
         recoveryWeight = RECOVERY_START_WEIGHT
         samples.clear()
         currentWeights = preferredWeights()
+        AppLogger.log(
+            "Weights",
+            "configureUserScores wifiScore=$wifiUserScore cellularScore=$cellularUserScore -> weights=$currentWeights",
+        )
 
         // A score change is an explicit user command: identity is freshly (re-)decided under
         // the 0-5s monitoring gate below. Once assigned, it stays sticky exactly as if scores
@@ -145,6 +149,20 @@ object DynamicWeightCalculator {
 
     @Synchronized
     fun update(
+        wifiAvailable: Boolean,
+        wifiLatency: Long,
+        cellularAvailable: Boolean,
+        cellularLatency: Long
+    ): NetworkWeights {
+        val result = updateInternal(wifiAvailable, wifiLatency, cellularAvailable, cellularLatency)
+        AppLogger.log(
+            "Weights",
+            "update(wifiAvail=$wifiAvailable wifiLatency=$wifiLatency cellAvail=$cellularAvailable cellLatency=$cellularLatency userScores=$wifiUserScore/$cellularUserScore) -> $result",
+        )
+        return result
+    }
+
+    private fun updateInternal(
         wifiAvailable: Boolean,
         wifiLatency: Long,
         cellularAvailable: Boolean,
@@ -262,6 +280,10 @@ object DynamicWeightCalculator {
         } else {
             NetworkWeights(100 - RECOVERY_START_WEIGHT, RECOVERY_START_WEIGHT)
         }
+        AppLogger.log(
+            "Weights",
+            "resetForPathRecovery(recoveredWifi=$recoveredWifi) -> weights=$currentWeights (userScores wifi=$wifiUserScore cellular=$cellularUserScore - this reset IGNORES them, next update() call should immediately re-assert them if they differ)",
+        )
         return currentWeights
     }
 

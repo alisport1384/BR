@@ -410,6 +410,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 (oldCellular == null && cellular != null) ||
                 (oldWifi != null && wifi != null && oldWifi != wifi) ||
                 (oldCellular != null && cellular != null && oldCellular != cellular)
+        AppLogger.log(
+            "Networks",
+            "onNetworksUpdated oldWifi=${oldWifi?.hashCode()} wifi=${wifi?.hashCode()} oldCellular=${oldCellular?.hashCode()} cellular=${cellular?.hashCode()} bothAvailable=$bothAvailable pathRecovered=$pathRecovered",
+        )
 
         when {
             wifi == null && cellular == null -> {

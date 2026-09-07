@@ -230,6 +230,10 @@ class BondingSocksServer(
                 // the UDP-associate case above - a single weighted-random sample would just as
                 // often pin the whole session to the low-weight path. See pickBestNetwork's doc.
                 val picked = pickBestNetwork() ?: throw IOException("No usable network")
+                AppLogger.log(
+                    "Path3",
+                    "TCP CONNECT pin chosen=${path3Router.describeNetwork(picked)} wifiWeight=$wifiWeight cellularWeight=$cellularWeight dest=$destHost:$destPort",
+                )
                 network = picked
                 // Protecting a socket only prevents VPN recursion; it does NOT select the
                 // physical uplink. The selected Network must create/bind the socket, otherwise
@@ -422,6 +426,10 @@ class BondingSocksServer(
 
                 if (pinnedSocket == null) {
                     val network = pickBestNetwork() ?: continue // both paths down - drop, same as before
+                    AppLogger.log(
+                        "Path3",
+                        "UDP ASSOCIATE pin chosen=${path3Router.describeNetwork(network)} wifiWeight=$wifiWeight cellularWeight=$cellularWeight dest=${decoded.host}:${decoded.port}",
+                    )
                     val socket = bindPinnedSocket(network) ?: continue
                     pinnedSocket = socket
                     activeRelays[relayId]?.network = network

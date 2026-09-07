@@ -23,6 +23,7 @@ class Path3Router {
     fun updateWeights(wifi: Int, cellular: Int) {
         wifiWeight = wifi.coerceIn(0, 100)
         cellularWeight = cellular.coerceIn(0, 100)
+        AppLogger.log("Path3", "updateWeights wifi=$wifiWeight cellular=$cellularWeight")
     }
 
     fun selectNetwork(slot: Int? = null): Network? {
@@ -56,5 +57,14 @@ class Path3Router {
             cellular -> cellularLatencyMs.coerceAtLeast(0)
             else -> 0L
         }
+    }
+
+    /** For diagnostics/logging only - identifies whether [network] is the current Wi-Fi or
+     *  Cellular reference, or neither (e.g. already stale/replaced). */
+    fun describeNetwork(network: Network?): String = when (network) {
+        null -> "none"
+        wifiNetwork -> "wifi"
+        cellularNetwork -> "cellular"
+        else -> "unknown(${network})"
     }
 }
