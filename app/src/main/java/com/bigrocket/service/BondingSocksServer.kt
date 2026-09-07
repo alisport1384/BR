@@ -46,6 +46,13 @@ class BondingSocksServer(
         /** 127.0.0.1-only; picked to avoid AetherUpstream's own 1819 and any other local port. */
         const val PORT = 12347
         private const val CONNECT_TIMEOUT_MS = 5000
+        // Section: bounds how long a TCP relay direction blocks with no data at all after the
+        // connection is established - separate from CONNECT_TIMEOUT_MS, which only bounds the
+        // initial handshake. Well under Aether's own ~90s internal TLS-handshake timeout
+        // observed in practice, so our own relay fails fast and Aether's retry/reconnect logic
+        // gets a chance to try again (a different edge, a different path) sooner rather than
+        // waiting out a much longer OS-level TCP stall.
+        private const val RELAY_READ_TIMEOUT_MS = 20_000
         private const val UDP_IDLE_TIMEOUT_MS = 60_000L
         private const val UDP_RECEIVE_TIMEOUT_MS = 1000
     }
@@ -243,6 +250,7 @@ class BondingSocksServer(
                 if (!vpnService.protect(socket)) throw IOException("Unable to protect TCP socket from VPN")
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(destHost, destPort), CONNECT_TIMEOUT_MS)
+                socket.soTimeout = RELAY_READ_TIMEOUT_MS
                 remote = socket
             }
         } catch (_: Exception) {
@@ -268,9 +276,10 @@ class BondingSocksServer(
 
         val remoteIn = remote.getInputStream()
         val remoteOut = remote.getOutputStream()
+        runCatching { client.soTimeout = RELAY_READ_TIMEOUT_MS }
 
-        val upload = scope.launch { pipe(clientIn, remoteOut) }
-        val download = scope.launch { pipe(remoteIn, clientOut) }
+        val upload = scope.launch { pipe(clientIn, remoteOut, "upload dest=$destHost:$destPort") }
+        val download = scope.launch { pipe(remoteIn, clientOut, "download dest=$destHost:$destPort") }
         upload.join()
         download.join()
 
@@ -282,7 +291,7 @@ class BondingSocksServer(
     private fun networkSocket(network: Network): Socket =
         network.socketFactory.createSocket()
 
-    private fun pipe(from: InputStream, to: OutputStream) {
+    private fun pipe(from: InputStream, to: OutputStream, label: String) {
         val buffer = ByteArray(16 * 1024)
         try {
             while (true) {
@@ -292,6 +301,12 @@ class BondingSocksServer(
                 to.flush()
                 TrafficStats.recordBytes(n)
             }
+        } catch (_: SocketTimeoutException) {
+            // Section: no response within RELAY_READ_TIMEOUT_MS - most likely the remote (or a
+            // DPI box in between) silently dropped the connection post-handshake rather than
+            // resetting it, which a bare TCP read would otherwise block on indefinitely. Logged
+            // distinctly from a normal close so this is visible without needing full verbosity.
+            AppLogger.log("Path3", "relay timeout ($label) after ${RELAY_READ_TIMEOUT_MS}ms idle")
         } catch (_: Exception) {
         } finally {
             runCatching { to.flush() }
