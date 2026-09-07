@@ -52,6 +52,8 @@ jobs:
       - name: Prepare Aether native sources
         run: |
           chmod +x scripts/fetch-natives.sh scripts/build-natives.sh
+          AETHER_REPO=QW-AI-Code/Aether \
+          AETHER_REF=v1.2.6-build.12 \
           scripts/fetch-natives.sh
 
       - name: Build Aether native cores

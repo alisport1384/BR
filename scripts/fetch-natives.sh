@@ -25,21 +25,15 @@ HEV_REPO="heiher/hev-socks5-tunnel"
 HEV_REF="${HEV_REF:-}"            # empty => default branch
 HEV_DIR="${NATIVE_DIR}/hev-socks5-tunnel"
 
-AETHER_REPO="${AETHER_REPO:-CluvexStudio/Aether}"
-AETHER_REF="${AETHER_REF:-}"      # empty => default branch
+AETHER_REPO="${AETHER_REPO:-QW-AI-Code/Aether}"
+AETHER_REF="${AETHER_REF:-v1.2.6-build.12}"  # pinned known-good upstream release
 AETHER_SRC="${NATIVE_DIR}/aether"
 
-# The engine source is VENDORED inside this repo at native/aether so the app's
-# own modifications (custom-range scanning in prober.rs / wg_prober.rs, etc.)
-# are ALWAYS compiled into libaether.so with zero manual steps. When this dir is
-# present we use it verbatim and never touch the network for the engine. Delete
-# native/aether (or set AETHER_FORCE_CLONE=1) to go back to cloning upstream.
-VENDORED_AETHER="${PROJECT_DIR}/native/aether"
-AETHER_FORCE_CLONE="${AETHER_FORCE_CLONE:-}"
-
-# clone_repo <url> <dir> <ref>
-# Tries the pinned ref first (tag or branch); on any failure cleanly falls back
-# to the repo's default branch. Always clones submodules recursively.
+# Aether is pinned to the known-good Mobile 1.2.6 release (bundled core 1.7.0).
+# The build intentionally uses that exact upstream source; a moving branch is never
+# accepted for this engine because the BigRocket integration depends on the 1.7.0
+# upstream-proxy chaining contract.
+# clone_repo <url> <dir> <ref> -- used for HEV where an optional ref may fall back.
 clone_repo() {
   local url="$1" dir="$2" ref="$3"
   rm -rf "${dir}"
@@ -56,6 +50,15 @@ clone_repo() {
   echo "   cloned ${url} @ default branch"
 }
 
+# Aether is pinned deliberately: falling back to a moving default branch would
+# silently reintroduce a different engine and invalidate the tested integration.
+clone_repo_exact() {
+  local url="$1" dir="$2" ref="$3"
+  rm -rf "${dir}"
+  git clone --depth 1 --branch "${ref}" --recursive "${url}" "${dir}"
+  echo "   cloned ${url} @ ${ref} (exact pin)"
+}
+
 echo "==> Fetching hev-socks5-tunnel (tunnel core)"
 clone_repo "${GH}/${HEV_REPO}.git" "${HEV_DIR}" "${HEV_REF}"
 if [ ! -f "${HEV_DIR}/Makefile" ]; then
@@ -65,19 +68,8 @@ if [ ! -f "${HEV_DIR}/Makefile" ]; then
 fi
 
 echo "==> Providing Aether engine source (engine)"
-if [ -z "${AETHER_FORCE_CLONE}" ] && \
-   find "${VENDORED_AETHER}" -name Cargo.toml -not -path '*/target/*' 2>/dev/null | grep -q .; then
-  echo "   using the VENDORED engine bundled in this repo: ${VENDORED_AETHER}"
-  echo "   (your prober.rs / wg_prober.rs changes are included automatically; no download needed)"
-  rm -rf "${AETHER_SRC}"
-  mkdir -p "${AETHER_SRC}"
-  # Copy everything except any local build output (target/).
-  ( cd "${VENDORED_AETHER}" && tar --exclude='./target' --exclude='*/target' -cf - . ) \
-    | ( cd "${AETHER_SRC}" && tar -xf - )
-else
-  echo "   no vendored source found (or AETHER_FORCE_CLONE set); cloning ${AETHER_REPO}"
-  clone_repo "${GH}/${AETHER_REPO}.git" "${AETHER_SRC}" "${AETHER_REF}"
-fi
+echo "   cloning pinned Aether ${AETHER_REPO} @ ${AETHER_REF}"
+clone_repo_exact "${GH}/${AETHER_REPO}.git" "${AETHER_SRC}" "${AETHER_REF}"
 # The Aether binary crate does NOT live at the repo root; it sits in a
 # subdirectory (e.g. aether/) next to the vendored quiche/ QUIC library. Just
 # verify at least one Cargo.toml exists; build-natives.sh locates the crate.
