@@ -25,61 +25,58 @@ HEV_REPO="heiher/hev-socks5-tunnel"
 HEV_REF="${HEV_REF:-}"            # empty => default branch
 HEV_DIR="${NATIVE_DIR}/hev-socks5-tunnel"
 
-AETHER_REPO="${AETHER_REPO:-QW-AI-Code/Aether}"
-AETHER_REF="${AETHER_REF:-v1.2.6-build.12}"
-AETHER_SRC="${NATIVE_DIR}/aether/native"
+AETHER_REPO="${AETHER_REPO:-CluvexStudio/Aether}"
+AETHER_REF="${AETHER_REF:-}"      # empty => default branch
+AETHER_SRC="${NATIVE_DIR}/aether"
 
-# BigRocket uses the exact Aether Mobile 1.2.6 source release (build.12).
-# That release vendors Aether Core v1.7.0 under native/aether and carries the
-# mobile-side core patches. Keep the complete mobile baseline instead of
-# fetching the standalone core repository, so the bundled engine cannot drift
-# from the 1.2.6 release the app contract targets.
-clone_repo_exact() {
+# The engine source is VENDORED inside this repo at native/aether so the app's
+# own modifications (custom-range scanning in prober.rs / wg_prober.rs, etc.)
+# are ALWAYS compiled into libaether.so with zero manual steps. When this dir is
+# present we use it verbatim and never touch the network for the engine. Delete
+# native/aether (or set AETHER_FORCE_CLONE=1) to go back to cloning upstream.
+VENDORED_AETHER="${PROJECT_DIR}/native/aether"
+AETHER_FORCE_CLONE="${AETHER_FORCE_CLONE:-}"
+
+# clone_repo <url> <dir> <ref>
+# Tries the pinned ref first (tag or branch); on any failure cleanly falls back
+# to the repo's default branch. Always clones submodules recursively.
+clone_repo() {
   local url="$1" dir="$2" ref="$3"
   rm -rf "${dir}"
-  git clone --depth 1 --branch "${ref}" --recursive "${url}" "${dir}"
-  echo "   cloned ${url} @ ${ref} (exact pin)"
+  if [ -n "${ref}" ] && \
+     git clone --depth 1 --branch "${ref}" --recursive "${url}" "${dir}" 2>/dev/null; then
+    echo "   cloned ${url} @ ${ref}"
+    return 0
+  fi
+  if [ -n "${ref}" ]; then
+    echo "   ref '${ref}' not found on ${url}; using default branch"
+  fi
+  rm -rf "${dir}"
+  git clone --depth 1 --recursive "${url}" "${dir}"
+  echo "   cloned ${url} @ default branch"
 }
 
 echo "==> Fetching hev-socks5-tunnel (tunnel core)"
-if [ -n "${HEV_REF}" ]; then
-  clone_repo_exact "${GH}/${HEV_REPO}.git" "${HEV_DIR}" "${HEV_REF}"
-else
-  rm -rf "${HEV_DIR}"
-  git clone --depth 1 --recursive "${GH}/${HEV_REPO}.git" "${HEV_DIR}"
-  echo "   cloned ${GH}/${HEV_REPO}.git @ default"
-fi
+clone_repo "${GH}/${HEV_REPO}.git" "${HEV_DIR}" "${HEV_REF}"
 if [ ! -f "${HEV_DIR}/Makefile" ]; then
   echo "ERROR: hev-socks5-tunnel checkout has no Makefile at ${HEV_DIR}" >&2
   ls -la "${HEV_DIR}" >&2 || true
   exit 1
 fi
 
-echo "==> Providing Aether Mobile 1.2.6 native source (engine)"
-echo "   cloning pinned Aether Mobile ${AETHER_REPO} @ ${AETHER_REF}"
-MOBILE_SRC="${NATIVE_DIR}/aether-mobile"
-clone_repo_exact "${GH}/${AETHER_REPO}.git" "${MOBILE_SRC}" "${AETHER_REF}"
-rm -rf "${AETHER_SRC}"
-mkdir -p "${AETHER_SRC}"
-cp -a "${MOBILE_SRC}/aether" "${AETHER_SRC}/aether"
-cp -a "${MOBILE_SRC}/quiche" "${AETHER_SRC}/quiche"
-rm -rf "${MOBILE_SRC}"
-
-AETHER_CARGO="${AETHER_SRC}/aether/Cargo.toml"
-if [ ! -f "${AETHER_CARGO}" ]; then
-  echo "ERROR: expected Aether core manifest not found: ${AETHER_CARGO}" >&2
-  exit 1
-fi
-
-# reqwest 0.12's SOCKS transport is feature-gated. Core 1.7.0 exposes the
-# upstream proxy API but omits that feature, which makes registration bypass
-# the configured SOCKS5 chain and can terminate before the local SOCKS listener
-# is exposed. Enable only the required transport feature.
-python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); old="features = [\"json\", \"rustls-tls\", \"cookies\"]"; new="features = [\"json\", \"rustls-tls\", \"cookies\", \"socks\"]"; assert old in s, "ERROR: unexpected Aether 1.7.0 reqwest declaration"; p.write_text(s.replace(old,new,1))' "${AETHER_CARGO}"
-
-if ! grep -q '^version = "1.7.0"' "${AETHER_CARGO}"; then
-  echo "ERROR: Aether Mobile 1.2.6 did not provide core v1.7.0." >&2
-  exit 1
+echo "==> Providing Aether engine source (engine)"
+if [ -z "${AETHER_FORCE_CLONE}" ] && \
+   find "${VENDORED_AETHER}" -name Cargo.toml -not -path '*/target/*' 2>/dev/null | grep -q .; then
+  echo "   using the VENDORED engine bundled in this repo: ${VENDORED_AETHER}"
+  echo "   (your prober.rs / wg_prober.rs changes are included automatically; no download needed)"
+  rm -rf "${AETHER_SRC}"
+  mkdir -p "${AETHER_SRC}"
+  # Copy everything except any local build output (target/).
+  ( cd "${VENDORED_AETHER}" && tar --exclude='./target' --exclude='*/target' -cf - . ) \
+    | ( cd "${AETHER_SRC}" && tar -xf - )
+else
+  echo "   no vendored source found (or AETHER_FORCE_CLONE set); cloning ${AETHER_REPO}"
+  clone_repo "${GH}/${AETHER_REPO}.git" "${AETHER_SRC}" "${AETHER_REF}"
 fi
 # The Aether binary crate does NOT live at the repo root; it sits in a
 # subdirectory (e.g. aether/) next to the vendored quiche/ QUIC library. Just

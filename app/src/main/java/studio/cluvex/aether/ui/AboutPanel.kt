@@ -141,8 +141,9 @@ fun AboutPanel(modifier: Modifier = Modifier) {
                     // Engine (core) version — same idea as the Windows edition's
                     // About page, which shows app version AND core version so a
                     // user can verify the bundled engine is current.
-                    // BuildConfig.CORE_VERSION is pinned to the native Aether core
-                    // selected by scripts/fetch-natives.sh for this build.
+                    // BuildConfig.CORE_VERSION is stamped at build time from
+                    // native/aether/CORE_VERSION, i.e. from whatever
+                    // scripts/sync-core.sh actually vendored for THIS build.
                     Text(
                         text = stringResource(R.string.about_core_version, BuildConfig.CORE_VERSION),
                         style = MaterialTheme.typography.bodySmall,
