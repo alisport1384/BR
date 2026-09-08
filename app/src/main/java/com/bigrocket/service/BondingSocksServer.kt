@@ -249,7 +249,19 @@ class BondingSocksServer(
                 val socket = networkSocket(picked)
                 if (!vpnService.protect(socket)) throw IOException("Unable to protect TCP socket from VPN")
                 socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(destHost, destPort), CONNECT_TIMEOUT_MS)
+                // Resolve destHost via picked.getAllByName(), not InetSocketAddress(String, Int)
+                // - the latter uses the system-default DNS resolver, which is not bound to
+                // `picked` (or to any protected socket) at all. A SOCKS5 client that sends a
+                // hostname rather than a pre-resolved IP (reqwest's SOCKS5 support does exactly
+                // this) would then have its DNS lookup go through an unrelated, unprotected
+                // path - independent of whatever weight/network was actually selected for the
+                // data connection, and liable to recurse into this VPN's own TUN. Network.getAllByName
+                // is safe to call unconditionally: for an already-literal IP it just parses it,
+                // same as InetAddress.getByName would, with no real query.
+                val resolved = picked.getAllByName(destHost).firstOrNull()
+                    ?: throw IOException("DNS resolution failed for $destHost on ${path3Router.describeNetwork(picked)}")
+                AppLogger.log("Path3", "resolved $destHost -> ${resolved.hostAddress} via ${path3Router.describeNetwork(picked)}")
+                socket.connect(InetSocketAddress(resolved, destPort), CONNECT_TIMEOUT_MS)
                 socket.soTimeout = RELAY_READ_TIMEOUT_MS
                 remote = socket
             }
