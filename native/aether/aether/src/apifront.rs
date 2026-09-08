@@ -74,6 +74,19 @@ impl Fingerprint {
 
         let tls = |error: boring::error::ErrorStack| AetherError::Tls(error.to_string());
 
+        // No CA chain verification - this connects to a random Cloudflare edge IP
+        // (random_edge_address()) rather than a hostname resolved through normal DNS, so the
+        // certificate the edge presents will not generally match a conventional CA chain check
+        // for this connection's SNI. Same rationale as tls.rs's install_verification for the
+        // MASQUE tunnel: standard CA validation doesn't apply to a deliberately domain-fronted
+        // connection like this one, and the security model here relies on the registration
+        // payload/response itself (and the subsequent WireGuard/Noise handshake) rather than on
+        // this outer TLS layer. Without this, boring::ssl::SslConnector::builder falls back to
+        // its compiled-in default CA search paths (e.g. /etc/ssl/certs), which do not exist on
+        // Android, and every connection fails with "unable to get local issuer certificate"
+        // regardless of which network or edge IP is used.
+        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+
         match self {
             Fingerprint::SplitLegacy => {
                 builder
