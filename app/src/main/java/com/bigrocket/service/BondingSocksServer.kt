@@ -369,6 +369,7 @@ class BondingSocksServer(
         // flow-level granularity already used everywhere else in this file and in
         // TunPacketRouter.
         var pinnedSocket: DatagramSocket? = null
+        var pinnedNetwork: Network? = null
         var receiverJob: Job? = null
 
         fun bindPinnedSocket(network: Network): DatagramSocket? = runCatching {
@@ -459,12 +460,15 @@ class BondingSocksServer(
                     )
                     val socket = bindPinnedSocket(network) ?: continue
                     pinnedSocket = socket
+                    pinnedNetwork = network
                     activeRelays[relayId]?.network = network
                     receiverJob = startPinnedReceiver(socket, decoded.host, decoded.port, fromAddr)
                 }
                 val socket = pinnedSocket ?: continue
                 runCatching {
-                    val dest = InetSocketAddress(InetAddress.getByName(decoded.host), decoded.port)
+                    val resolvedAddr = pinnedNetwork?.getAllByName(decoded.host)?.firstOrNull()
+                        ?: InetAddress.getByName(decoded.host)
+                    val dest = InetSocketAddress(resolvedAddr, decoded.port)
                     socket.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
                 }
                 TrafficStats.recordBytes(decoded.payload.size)
