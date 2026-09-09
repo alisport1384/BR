@@ -401,16 +401,23 @@ class BondingSocksServer(
                 }
             }
 
-        // TUN ASSOCIATE lives for as long as the SOCKS5 control TCP connection stays open -
-        // this small watcher just closes the UDP side (and unblocks the receive loop below)
-        // the moment hev drops it, matching standard SOCKS5 UDP ASSOCIATE semantics.
+        // TUN ASSOCIATE: per strict SOCKS5 (RFC 1928), the UDP association should end when the
+        // control TCP connection closes. In practice, Aether's own client appears to close the
+        // control connection promptly after receiving the ASSOCIATE reply - reasonable when
+        // scanning ~285 candidates in parallel, since holding that many TCP connections open
+        // simultaneously just to keep each UDP association alive would be wasteful - and only
+        // sends the actual UDP probe packet afterward. Tearing down localUdp immediately on
+        // control-connection EOF would race against that and lose almost every time, which is
+        // exactly what was observed: the ASSOCIATE handshake succeeding (Aether logs receiving
+        // the port) but no UDP packet ever actually being decoded on our side. So this
+        // deliberately does NOT close localUdp here - UDP_IDLE_TIMEOUT_MS below is the sole
+        // cleanup mechanism, which is already generous enough (60s) relative to any single
+        // probe's few-second window.
         val controlWatcher = scope.launch {
             try {
                 val buf = ByteArray(1)
                 while (client.getInputStream().read(buf) >= 0) { /* control channel stays open */ }
             } catch (_: Exception) {
-            } finally {
-                runCatching { localUdp.close() }
             }
         }
 
