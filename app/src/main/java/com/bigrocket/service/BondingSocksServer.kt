@@ -329,6 +329,7 @@ class BondingSocksServer(
 
     private suspend fun handleUdpAssociate(relayId: Int, client: Socket, clientOut: OutputStream) {
         val localUdp = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
+        AppLogger.log("Path3", "UDP ASSOCIATE opened, localUdp bound to 127.0.0.1:${localUdp.localPort}")
         val mode = upstreamMode
         val aetherAssociation = if (mode == UpstreamMode.AETHER) {
             try {
@@ -446,7 +447,15 @@ class BondingSocksServer(
                     break
                 }
                 lastActivity = System.currentTimeMillis()
-                val decoded = decodeSocksUdp(packet.data, packet.length) ?: continue
+                AppLogger.log(
+                    "Path3",
+                    "UDP ASSOCIATE raw packet len=${packet.length} from=${packet.socketAddress} bytes=${packet.data.copyOfRange(0, minOf(packet.length, 16)).joinToString(",") { (it.toInt() and 0xFF).toString() }}",
+                )
+                val decoded = decodeSocksUdp(packet.data, packet.length)
+                if (decoded == null) {
+                    AppLogger.log("Path3", "UDP ASSOCIATE decode FAILED for that packet")
+                    continue
+                }
                 val fromAddr = packet.socketAddress as? InetSocketAddress ?: continue
 
                 if (aetherAssociation != null) {
