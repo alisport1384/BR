@@ -329,6 +329,7 @@ class BondingSocksServer(
 
     private suspend fun handleUdpAssociate(relayId: Int, client: Socket, clientOut: OutputStream) {
         val localUdp = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
+        vpnService.protect(localUdp)
         AppLogger.log("Path3", "UDP ASSOCIATE opened, localUdp bound to 127.0.0.1:${localUdp.localPort}")
         val mode = upstreamMode
         val aetherAssociation = if (mode == UpstreamMode.AETHER) {
