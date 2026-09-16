@@ -29,6 +29,13 @@ jobs:
       # is ever produced.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Google removed the deprecated 'tools' package from the SDK repo
+          # index (2026-09-15); the action's default `packages` input still
+          # requests it, so the step fails before anything else runs. We only
+          # ever used this step for cmdline-tools/platform-tools anyway —
+          # platforms/build-tools/ndk are installed explicitly below.
+          packages: "platform-tools"
 
       - name: Install required SDK platform & build-tools
         run: |
@@ -37,6 +44,8 @@ jobs:
 
       - name: Set up Android NDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
 
       - name: Install Rust toolchain and Android targets
         shell: bash
