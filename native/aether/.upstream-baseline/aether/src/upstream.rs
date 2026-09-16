@@ -506,105 +506,6 @@ async fn attach_detour_via(
     Ok(DetourGuard(Some((client, id, task.abort_handle()))))
 }
 
-// >>> AETHER-APP-PATCH udp-socket-buffer-asymmetry
-/// Applies the platform tuning profile's socket buffers to a datagram socket.
-///
-/// ## 1.2.8 MEDIA-STALL FIX (the half that was right)
-///
-/// `sysprofile` had been sizing these for three releases and logging the number
-/// at startup, but only the QUIC/MASQUE path ever applied it. Every WireGuard
-/// socket - which is to say the entire WARP and gool data plane - ran on the OS
-/// default. That is a handful of milliseconds of a 4K video stream, so the first
-/// time the reader was late the kernel started discarding datagrams, and among
-/// them were the handshake replies the session needed to stay alive. Raising
-/// `SO_RCVBUF` fixed that and still does.
-///
-/// ## 1.2.8-r6 ROOT CAUSE (the half that was wrong)
-///
-/// That fix set **both** directions from the one figure, so it also handed every
-/// WireGuard socket a 7 MB `SO_SNDBUF`. A receive buffer that large only prevents
-/// loss. A SEND buffer that large is an unbounded queue in the kernel, sitting
-/// directly downstream of every throttle rounds r2, r4 and r5 added - and it
-/// disabled all of them at once, because `send()` on a datagram socket is only
-/// ever backpressure when `SO_SNDBUF` is full, and 7 MB never is.
-///
-/// The chain, and where it broke:
-///
-/// ```text
-///   smoltcp tx buffer   512 KB   r4/r5 sized it
-///   StackDevice.tx       64 pkt  r5 made transmit() refuse at this depth
-///   outbound mpsc       256 pkt  r2 bounded it
-///   UDP SO_SNDBUF         7 MB   <- writer never blocks, so nothing above
-///                                   this line can ever engage
-/// ```
-///
-/// The r5 field log proves it in one column: `backpressure 0` on all 96
-/// telemetry lines of a 13-minute session during which a fresh dial over the
-/// same path cost 5694 ms and a round trip measured 3092 ms. The standing queue
-/// was real and it was entirely in the kernel.
-///
-/// So the two directions are sized independently now. The kernel silently clamps
-/// both to `net.core.{r,w}mem_max`, and Linux DOUBLES `SO_SNDBUF` and reports the
-/// doubled value, so asking for more than the device allows stays harmless and
-/// the reported figure being ~2x the request is expected.
-pub fn tune_udp_buffers(socket: &UdpSocket) {
-    let want_rcv = crate::sysprofile::udp_socket_rcv_buf_bytes();
-    let want_snd = crate::sysprofile::udp_socket_snd_buf_bytes();
-
-    #[cfg(unix)]
-    {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        // Safe: `socket` owns the descriptor and outlives this borrow.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
-        let reference = socket2::SockRef::from(&borrowed);
-        let _ = reference.set_recv_buffer_size(want_rcv);
-        let _ = reference.set_send_buffer_size(want_snd);
-
-        // A kernel that refuses to shrink the send buffer restores the r6 root
-        // cause in full silence, so it is not allowed to be silent. `wmem_min`
-        // and a doubled report are both normal; three times the request is not.
-        if let Ok(applied) = reference.send_buffer_size() {
-            if applied > want_snd.saturating_mul(3) {
-                log::warn!(
-                    "[-] the kernel kept SO_SNDBUF at {}KB although {}KB was requested; the \
-                     uplink queue is NOT bounded on this device and the congestion controller \
-                     will not see backpressure. Send this log.",
-                    applied / 1024,
-                    want_snd / 1024,
-                );
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (want_rcv, want_snd);
-    }
-}
-
-/// The `SO_SNDBUF` the kernel actually granted, in KB (0 when unknown).
-///
-/// Reported once per uplink telemetry window by the WireGuard writer, because
-/// this number is the difference between a bounded uplink and the r5 build.
-pub fn send_buffer_kb(socket: &UdpSocket) -> usize {
-    #[cfg(unix)]
-    {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        let borrowed = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
-        let reference = socket2::SockRef::from(&borrowed);
-        reference
-            .send_buffer_size()
-            .map(|b| b / 1024)
-            .unwrap_or(0)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket;
-        0
-    }
-}
-// <<< AETHER-APP-PATCH udp-socket-buffer-asymmetry
-
 pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAddr, DetourGuard)> {
     let bind = if peer.is_ipv4() {
         "0.0.0.0:0"
@@ -613,11 +514,6 @@ pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAdd
     };
 
     let socket = crate::egress::udp_bind(bind.parse().expect("a wildcard address"))?;
-    // AETHER-APP-PATCH udp-socket-buffer-asymmetry: the split rcv/snd sizing
-    // applies to the egress-bound socket too - core 2.0.0 changed HOW this
-    // socket is created (it can carry a firewall mark now), not how big its
-    // buffers have to be.
-    tune_udp_buffers(&socket);
     let detour = attach_detour(&socket, peer).await?;
 
     let local = socket.local_addr()?;

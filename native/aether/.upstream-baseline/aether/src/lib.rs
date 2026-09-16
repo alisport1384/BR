@@ -94,25 +94,6 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
             .try_init();
 
     log::info!("Aether v{}", env!("CARGO_PKG_VERSION"));
-    // >>> AETHER-APP-PATCH build-provenance
-    // 1.2.8-r5. The line above is the UPSTREAM core version and it was 1.8.0 in
-    // r2, r3 and r4 alike, so it identified nothing. This one identifies the
-    // build. `AETHER-BUILD-STAMP:` is also embedded as a literal in the binary,
-    // which is what build-natives.sh and CI grep for; printing it here is what
-    // lets the Kotlin side cross-check the engine against the APK and what makes
-    // any future field log self-identifying in its second line.
-    log::info!(
-        "[*] {} (app patch level {}; netstack congestion control=cubic, device backpressure=on, uplink sndbuf=bounded, flow liveness=acked-bytes, uplink admission=rate-x-500ms)",
-        env!("AETHER_BUILD_STAMP"),
-        env!("AETHER_APP_PATCHLEVEL"),
-    );
-    if env!("AETHER_APP_PATCHLEVEL") == "unstamped" {
-        log::warn!(
-            "[-] this engine was built without APP_PATCHLEVEL and cannot be identified; \
-             build it through scripts/build-natives.sh so the stamp is applied"
-        );
-    }
-    // <<< AETHER-APP-PATCH build-provenance
     sysprofile::log_summary();
     sysprofile::raise_fd_limit();
     egress::init()?;
@@ -1120,79 +1101,6 @@ async fn hunt_masque_peer(
     Ok(SocketAddr::new(best.ip, best.port))
 }
 
-
-// >>> AETHER-APP-PATCH quick-reconnect-rtt-budget
-/// How good a CACHED endpoint has to be before `--quick-reconnect` reuses it
-/// instead of scanning.
-///
-/// ROOT CAUSE this fixes. Quick reconnect reused any cached endpoint that still
-/// answered, no matter how slow it had become. A field log shows the cached
-/// WireGuard endpoint accepted at `rtt 472ms` and the scan skipped, in the same
-/// second the network fingerprint had measured 100-143ms edges: the session then
-/// ran on an endpoint three to four times slower than what was actually
-/// available, and kept running on it for as long as the cache survived. TCP
-/// throughput is inversely proportional to RTT, so both download and upload were
-/// roughly halved - and in the chained two-hop mode that penalty is paid twice,
-/// which is exactly the "Aether alone is fast, Aether + Psiphon is half speed"
-/// report this patch answers.
-///
-/// A cached endpoint is now only reused when it is not merely alive but still
-/// FAST. Over budget, the cache is skipped and a normal scan runs: that costs a
-/// few seconds once, and the better endpoint it finds is what gets re-cached.
-///
-/// Budget in milliseconds, read from `AETHER_QUICK_RECONNECT_MAX_RTT_MS` for the
-/// WireGuard/gool data-plane probe and from
-/// `AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS` for the MASQUE probe (which is a
-/// full QUIC/TLS handshake and therefore several times an RTT). Unset, zero or
-/// unparsable disables the check and restores the previous behaviour exactly.
-fn env_budget_ms(name: &str) -> Option<std::time::Duration> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(std::time::Duration::from_millis)
-}
-
-fn within_budget(
-    peer: SocketAddr,
-    measured: std::time::Duration,
-    budget: Option<std::time::Duration>,
-    what: &str,
-) -> bool {
-    match budget {
-        Some(limit) if measured > limit => {
-            log::warn!(
-                "[-] cached endpoint {peer} answered but is slow ({what} {:?} over the {:?} budget); ignoring the cache and scanning for a faster endpoint",
-                measured,
-                limit
-            );
-            false
-        }
-        _ => true,
-    }
-}
-
-/// Data-plane RTT budget (WireGuard / gool cached endpoint).
-fn cached_peer_fast_enough(peer: SocketAddr, rtt: std::time::Duration) -> bool {
-    within_budget(
-        peer,
-        rtt,
-        env_budget_ms("AETHER_QUICK_RECONNECT_MAX_RTT_MS"),
-        "rtt",
-    )
-}
-
-/// Handshake budget (MASQUE cached gateway; one QUIC/TLS setup, not one RTT).
-fn cached_handshake_fast_enough(peer: SocketAddr, elapsed: std::time::Duration) -> bool {
-    within_budget(
-        peer,
-        elapsed,
-        env_budget_ms("AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS"),
-        "handshake",
-    )
-}
-// <<< AETHER-APP-PATCH quick-reconnect-rtt-budget
-
 fn lastconn_path(config_path: &str) -> String {
     derive_sibling_path(config_path, "lastconn")
 }
@@ -1280,17 +1188,9 @@ async fn run_masque(
             if let Ok(peer) = cached.peer.parse::<SocketAddr>() {
                 if want_quick_reconnect(&cached).await {
                     log::info!("[*] verifying cached gateway {peer} before reuse");
-                    // >>> AETHER-APP-PATCH quick-reconnect-rtt-budget
-                    let quick_probe_started = std::time::Instant::now();
-                    // <<< AETHER-APP-PATCH quick-reconnect-rtt-budget
                     if quick_verify_masque_peer(&identity, peer).await {
                         log::info!("[+] cached gateway {peer} still works; skipping scan");
                         quick_peer = Some(peer);
-                        // >>> AETHER-APP-PATCH quick-reconnect-rtt-budget
-                        if !cached_handshake_fast_enough(peer, quick_probe_started.elapsed()) {
-                            quick_peer = None;
-                        }
-                        // <<< AETHER-APP-PATCH quick-reconnect-rtt-budget
                     } else {
                         log::warn!("[-] cached gateway {peer} no longer works; scanning fresh");
                     }
@@ -2066,21 +1966,6 @@ async fn run_wireguard(
                                 rtt
                             );
                             quick = Some((peer, profile, cached.profile.clone()));
-                            // >>> AETHER-APP-PATCH quick-reconnect-rtt-budget
-                            if !cached_peer_fast_enough(peer, rtt) {
-                                quick = None;
-                                // >>> AETHER-APP-PATCH scan-rtt-floor (1.2.8-r5)
-                                // Discarding the cache is a BET that the scan can
-                                // do better. Register what it has to beat, so a
-                                // lost bet costs nothing instead of costing the
-                                // session a worse endpoint. See
-                                // wg_prober::apply_rtt_floor for the field log
-                                // this answers (396.85 ms rejected, 475.01 ms
-                                // accepted, 2 ms apart).
-                                wg_prober::set_rtt_floor(peer, rtt);
-                                // <<< AETHER-APP-PATCH scan-rtt-floor
-                            }
-                            // <<< AETHER-APP-PATCH quick-reconnect-rtt-budget
                         }
                         Err(e) => {
                             log::warn!(
@@ -2281,13 +2166,9 @@ async fn run_wireguard_tunnel(
     .await
     .map_err(|e| AetherError::Other(format!("tunnel failed validation: {e}")))?;
     log::info!("[+] wireguard tunnel validated (end-to-end data confirmed); exposing socks5");
-    // >>> AETHER-APP-PATCH scan-rtt-floor (1.2.8-r5)
-    // The bet is settled; a later reconnect must be judged on its own numbers.
-    wg_prober::clear_rtt_floor();
-    // <<< AETHER-APP-PATCH scan-rtt-floor
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
     let tunnel = wireguard::WgTunnel::from_established(
         session,
@@ -2407,8 +2288,8 @@ async fn establish_wg(
     .map_err(|e| AetherError::Other(format!("[{label}] tunnel failed validation: {e}")))?;
     log::info!("[+] [{label}] wireguard tunnel validated (end-to-end data confirmed)");
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
     let tunnel = wireguard::WgTunnel::from_established(
         session,
@@ -2454,36 +2335,18 @@ impl Drop for TaskGuard {
     }
 }
 
-
-
-/// Budget for handing one inner-tunnel datagram to the outer stack.
-///
-/// 1.2.8: this relay carries EVERY byte of a gool session. It used to await the
-/// handoff with no bound at all, so whenever the outer stack was momentarily
-/// behind, the only reader of the inner tunnel's loopback socket parked - and
-/// the loopback receive buffer, which is small, threw away everything that
-/// arrived meanwhile, including the inner tunnel's handshake traffic. Waiting a
-/// few milliseconds is fine; going deaf is not.
-const GOOL_RELAY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
-
 async fn spawn_udp_forwarder(
     outer: &netstack::StackHandle,
     remote: SocketAddr,
 ) -> Result<(SocketAddr, TaskGuard)> {
     let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
-    // A video's worth of 1200-byte datagrams overruns the default loopback
-    // buffers long before the relay is slow enough to matter.
-    upstream::tune_udp_buffers(&sock);
     let local = sock.local_addr()?;
 
     let udp = outer.open_udp().await?;
     let (udp_tx, mut udp_rx) = udp.into_split();
 
-    // parking_lot, not tokio::sync: this lock is held for a couple of
-    // instructions on the hot path of every single packet, and an async mutex
-    // there buys nothing but scheduler work.
-    let inner_peer: std::sync::Arc<parking_lot::Mutex<Option<SocketAddr>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let inner_peer: std::sync::Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     let up_sock = sock.clone();
     let up_peer = inner_peer.clone();
@@ -2492,30 +2355,16 @@ async fn spawn_udp_forwarder(
         loop {
             match up_sock.recv_from(&mut buf).await {
                 Ok((n, from)) => {
-                    // Upstream 2.0.0 pins the relay to the first inner peer it
-                    // hears from, so a stray loopback datagram from anything
-                    // else cannot steal the downlink. Kept, with the app's
-                    // parking_lot lock instead of the async mutex upstream
-                    // uses: this is the hot path of every gool packet.
                     {
-                        let mut known = up_peer.lock();
+                        let mut known = up_peer.lock().await;
                         match *known {
                             Some(peer) if peer != from => continue,
                             Some(_) => {}
                             None => *known = Some(from),
                         }
                     }
-                    match tokio::time::timeout(
-                        GOOL_RELAY_HANDOFF_BUDGET,
-                        udp_tx.send_to(remote, buf[..n].to_vec()),
-                    )
-                    .await
-                    {
-                        // Handed over, or dropped on purpose because the outer
-                        // stack is congested - the loss signal the inner
-                        // tunnel's congestion control is built to read.
-                        Ok(Ok(())) | Err(_) => {}
-                        Ok(Err(_)) => break,
+                    if udp_tx.send_to(remote, buf[..n].to_vec()).await.is_err() {
+                        break;
                     }
                 }
                 Err(_) => break,
@@ -2527,7 +2376,7 @@ async fn spawn_udp_forwarder(
     let down_peer = inner_peer.clone();
     let down_task = tokio::spawn(async move {
         while let Some((_src, data)) = udp_rx.recv().await {
-            let dst = *down_peer.lock();
+            let dst = *down_peer.lock().await;
             if let Some(dst) = dst {
                 let _ = down_sock.send_to(&data, dst).await;
             }
@@ -2851,27 +2700,6 @@ async fn select_ip_version() -> prober::IpScan {
         Some("3") => prober::IpScan::Both,
         _ => prober::IpScan::V4,
     }
-}
-
-/// Depth of the two PACKET handoff queues (netstack <-> WireGuard), in packets.
-///
-/// 1.2.8-r2 BUFFERBLOAT FIX. These two were sized from
-/// `sysprofile::channel_capacity()`, which is an *application* queue depth and is
-/// 1024 on a high-tier phone. 1024 packets at a 1280-byte MTU is ~1.3 MB of
-/// standing queue in EACH direction, on top of the netstack's own retained burst
-/// - several seconds of buffer on a mobile uplink. That is not a capacity
-/// problem, it is a latency problem, and it is a large part of the "ping goes to
-/// 2000 while data is still moving" the user reported: the packets were not lost,
-/// they were queued locally behind each other.
-///
-/// These queues are a device transmit/receive ring, not a congestion window.
-/// Throughput is governed by smoltcp's own socket buffers
-/// (`sysprofile::netstack_tcp_tx_buf_bytes`), so keeping the ring short costs no
-/// bandwidth and buys back the entire queueing delay. 256 packets (~320 KB) is
-/// still an order of magnitude more than any scheduling hiccup needs.
-fn packet_queue_capacity() -> usize {
-    const PACKET_QUEUE_MAX: usize = 256;
-    sysprofile::channel_capacity().min(PACKET_QUEUE_MAX).max(64)
 }
 
 #[cfg(test)]

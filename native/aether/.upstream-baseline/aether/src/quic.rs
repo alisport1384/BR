@@ -31,15 +31,9 @@ async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
 
-    // >>> AETHER-APP-PATCH udp-socket-buffer-asymmetry
-    // 1.2.8-r6: rcv and snd are separate budgets. See upstream::tune_udp_buffers
-    // for why one figure for both was the root cause of the live-stream stall.
-    let _ = sock.set_recv_buffer_size(crate::sysprofile::udp_socket_rcv_buf_bytes());
-    let _ = sock.set_send_buffer_size(crate::sysprofile::udp_socket_snd_buf_bytes());
-    // <<< AETHER-APP-PATCH udp-socket-buffer-asymmetry
-    // AETHER-CORE-PORT 2.0.0: the QUIC/MASQUE socket carries the firewall mark
-    // too, so a Linux router can route the engine's own traffic without it
-    // looping back through the tunnel.
+    let buf_size = crate::sysprofile::udp_socket_buf_bytes();
+    let _ = sock.set_recv_buffer_size(buf_size);
+    let _ = sock.set_send_buffer_size(buf_size);
     crate::egress::apply(socket2::SockRef::from(&sock)).map_err(AetherError::Io)?;
 
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
