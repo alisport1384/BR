@@ -1,0 +1,142 @@
+package com.bigrocket.service
+
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import studio.cluvex.aether.core.AetherController
+import studio.cluvex.aether.core.AetherProcess
+import studio.cluvex.aether.core.EngineMeta
+import studio.cluvex.aether.core.PortProbe
+import studio.cluvex.aether.core.NetProbe
+import studio.cluvex.aether.core.TunnelConfig
+import studio.cluvex.aether.data.ProfileStore
+import studio.cluvex.aether.model.ConnectionProfile
+import studio.cluvex.aether.model.ConnectionState
+
+/** Runs Aether in embedded proxy mode so BigRocket remains the only Android VPN. */
+object EmbeddedAetherRuntime {
+    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private var job: Job? = null
+    private var process: AetherProcess? = null
+
+    private const val UPSTREAM_PREFS = "bigrocket_upstream"
+    private const val KEY_UPSTREAM_CHOICE = "upstream_choice"
+
+    /**
+     * Owned here, not in MainActivity: the Service must be able to read (and start/stop
+     * Aether from) this choice on its own, independent of whether any Activity currently
+     * exists - that is the whole point of this step (see learnings-and-working-style: engine
+     * lifecycle must be Service-owned, not Activity-owned, or a recreated/reopened Activity
+     * can race a healthy running engine - which is exactly what previously caused the
+     * reconnect flap on reopening the app).
+     *
+     * [XRAY] = Direct + Xray (TUN traffic → Xray → bonding boundary → physical paths).
+     * [AETHER_XRAY] = Direct + Aether + Xray (TUN traffic → Xray → Aether → bonding
+     * boundary → physical paths). Both are orchestrated by BigRocketVpnService's
+     * applyUpstreamChoice(), exactly like NONE/AETHER.
+     */
+    enum class UpstreamChoice { NONE, AETHER, XRAY, AETHER_XRAY }
+
+    /** Synchronous on purpose - see loadUpstreamChoice()'s callers for why. */
+    fun readUpstreamChoice(context: Context): UpstreamChoice {
+        val name = context.getSharedPreferences(UPSTREAM_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_UPSTREAM_CHOICE, null)
+        return runCatching { UpstreamChoice.valueOf(name ?: "") }.getOrDefault(UpstreamChoice.NONE)
+    }
+
+    fun saveUpstreamChoice(context: Context, choice: UpstreamChoice) {
+        context.getSharedPreferences(UPSTREAM_PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_UPSTREAM_CHOICE, choice.name)
+            .apply()
+    }
+
+    private val _enabled = MutableStateFlow(false)
+    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    private val _trafficReady = MutableStateFlow(false)
+    val trafficReady: StateFlow<Boolean> = _trafficReady.asStateFlow()
+
+    fun start(context: Context, profile: ConnectionProfile) {
+        if (job?.isActive == true) return
+        _enabled.value = true
+        _trafficReady.value = false
+        val app = context.applicationContext
+        job = scope.launch {
+            runCatching {
+                AetherController.setState(ConnectionState.Launching)
+                EngineMeta.reset()
+                // Aether must consume BigRocket's already-bonded transport. Its own
+                // physical dials are therefore chained through the local SOCKS5
+                // bonding boundary instead of going directly to Wi-Fi/Cellular.
+                val embeddedProfile = profile.copy(
+                    proxyMode = true,
+                    upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
+                )
+                ProfileStore(app).save(embeddedProfile)
+                val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
+                process = engine
+                engine.start(embeddedProfile)
+                AetherController.setState(ConnectionState.Connecting)
+                // GOOL establishes two sequential WireGuard layers before the
+                // native SOCKS5 listener is created. Use the protocol's full
+                // startup budget here instead of failing while the inner tunnel
+                // is still legitimately being established.
+                val startupTimeoutMs = embeddedProfile.connectTimeoutMs().coerceAtLeast(10_000L)
+                // NOTE: embeddedProfile.upstreamProxy ("socks5://127.0.0.1:${BondingSocksServer.PORT}")
+                // is where Aether sends ITS OWN outbound traffic (the --upstream target).
+                // It is unrelated to the port Aether exposes ITS OWN SOCKS5 relay on for us
+                // to consume — that is always the fixed TunnelConfig.SOCKS_PORT (1819).
+                // Probing BondingSocksServer's port here always returns "open" immediately
+                // (it's up from VPN start), which made every protocol falsely report
+                // Connected before Aether's tunnel was actually ready.
+                val open = PortProbe.awaitOpen(
+                    TunnelConfig.SOCKS_HOST,
+                    TunnelConfig.SOCKS_PORT,
+                    startupTimeoutMs,
+                    isEngineAlive = { engine.isAlive() },
+                )
+                if (!open) error("Aether SOCKS5 listener did not become ready")
+                AetherController.setState(ConnectionState.Verifying)
+                AetherController.setIpLoading(true)
+                val ip = NetProbe.fetchIpInfoViaSocks(
+                    TunnelConfig.SOCKS_HOST,
+                    TunnelConfig.SOCKS_PORT,
+                )
+                AetherController.setIpInfo(ip?.let { studio.cluvex.aether.core.IpEndpoint(it.ip, it.countryCode, true) })
+                AetherController.setIpLoading(false)
+                AetherController.setState(ConnectionState.Connected("${TunnelConfig.SOCKS_HOST}:${TunnelConfig.SOCKS_PORT}"))
+                _trafficReady.value = true
+            }.onFailure {
+                AetherController.setState(ConnectionState.Error(it.message ?: "Aether connection failed"))
+                _enabled.value = false
+                _trafficReady.value = false
+                stopInternal()
+            }
+        }
+    }
+
+    fun stop(context: Context) {
+        _enabled.value = false
+        _trafficReady.value = false
+        job?.cancel()
+        job = null
+        stopInternal()
+        AetherController.setState(ConnectionState.Idle)
+        EngineMeta.reset()
+    }
+
+    private fun stopInternal() {
+        runCatching { process?.stop() }
+        process = null
+    }
+
+    fun isRunning(): Boolean = process?.isAlive() == true
+
+    fun isTrafficReady(): Boolean = _trafficReady.value
+}
