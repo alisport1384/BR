@@ -211,6 +211,12 @@ class TcpRelayEngine(
                         destinationHost = key.destinationIp,
                         destinationPort = key.destinationPort,
                     )
+                    UpstreamMode.XRAY -> AetherUpstream.openTcp(
+                        vpnService = vpnService,
+                        destinationHost = key.destinationIp,
+                        destinationPort = key.destinationPort,
+                        proxyPort = EmbeddedXrayRuntime.SOCKS_PORT,
+                    )
                     UpstreamMode.NONE -> {
                         val direct = targetNetwork.socketFactory.createSocket()
                         check(vpnService.protect(direct)) { "Unable to protect TCP socket from VPN" }

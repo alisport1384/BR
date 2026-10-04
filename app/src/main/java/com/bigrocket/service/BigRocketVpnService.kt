@@ -40,6 +40,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import studio.cluvex.aether.core.DiagnosticsLog
 import studio.cluvex.aether.core.HevConfig
 import studio.cluvex.aether.core.HevTunnel
+import studio.cluvex.aether.core.TunnelConfig
 
 /**
  * Core VPN service.
@@ -168,6 +169,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     // HevTunnel), which - EXPLORATORY, see applyUpstreamMode's comment - replaces the
     // JVM router entirely while active. Only one may ever read the TUN fd at a time.
     @Volatile private var usingHevEngine = false
+    // Which local SOCKS listener the LIVE hev instance was started against (Aether's or
+    // Xray's). Only meaningful while usingHevEngine is true; lets applyUpstreamModeLocked
+    // detect a chain-entry-point switch that requires restarting hev with a new config.
+    @Volatile private var activeHevSocksPort = TunnelConfig.SOCKS_PORT
     // Serializes engine handoff against itself (trafficReady can emit again before a
     // previous handoff finishes) - NOT against controlMutex/start-stop, which already
     // serialize the coroutine this runs on.
@@ -196,8 +201,54 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         // Apply the active embedded proxy's readiness to the router the moment it changes,
         // instead of only picking it up on the next 4s weight-update tick - so app traffic
         serviceScope.launch {
-            EmbeddedAetherRuntime.trafficReady.collectLatest { ready -> applyUpstreamMode(ready) }
+            combine(
+                EmbeddedAetherRuntime.trafficReady,
+                EmbeddedXrayRuntime.trafficReady,
+            ) { aetherReady, xrayReady -> aetherReady to xrayReady }
+                .collectLatest { (aetherReady, xrayReady) ->
+                    onChainReadinessChanged(aetherReady, xrayReady)
+                }
         }
+    }
+
+    /**
+     * Reacts to either embedded engine's readiness changing. Two jobs:
+     *
+     * 1. Second stage of the Direct + Aether + Xray chain: Xray's outbound dials
+     *    through Aether's local SOCKS5, so Xray may only be launched once Aether
+     *    is actually carrying traffic - never in parallel with it.
+     * 2. Translate (choice, readiness) into the single engine-level state
+     *    (chain entry point + ready) that applyUpstreamMode() acts on.
+     */
+    private suspend fun onChainReadinessChanged(aetherReady: Boolean, xrayReady: Boolean) {
+        val choice = EmbeddedAetherRuntime.readUpstreamChoice(applicationContext)
+        if (isRunning &&
+            choice == EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY &&
+            aetherReady &&
+            !EmbeddedXrayRuntime.isRunning()
+        ) {
+            AppLogger.log("VpnService", "Aether ready - starting Xray stage of Direct+Aether+Xray chain")
+            EmbeddedXrayRuntime.start(applicationContext, chainPort = TunnelConfig.SOCKS_PORT)
+        }
+        val (chainMode, chainReady) = currentChainState(aetherReady, xrayReady)
+        applyUpstreamMode(chainReady, chainMode)
+    }
+
+    /**
+     * Single source of truth for "which local SOCKS entry point should carry TUN
+     * traffic right now, and is it ready?". For both Xray chains the entry point
+     * is Xray's listener; whether Xray then dials via the bonding boundary or via
+     * Aether is fixed inside its generated config, not here.
+     */
+    private fun currentChainState(
+        aetherReady: Boolean = EmbeddedAetherRuntime.isTrafficReady(),
+        xrayReady: Boolean = EmbeddedXrayRuntime.isTrafficReady(),
+    ): Pair<UpstreamMode, Boolean> = when (EmbeddedAetherRuntime.readUpstreamChoice(applicationContext)) {
+        EmbeddedAetherRuntime.UpstreamChoice.NONE -> UpstreamMode.NONE to false
+        EmbeddedAetherRuntime.UpstreamChoice.AETHER -> UpstreamMode.AETHER to aetherReady
+        EmbeddedAetherRuntime.UpstreamChoice.XRAY -> UpstreamMode.XRAY to xrayReady
+        EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY ->
+            UpstreamMode.XRAY to (aetherReady && xrayReady)
     }
 
     /**
@@ -270,37 +321,50 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
      * handoff, and is one of the first things to double-check if this path shows odd
      * one-off glitches right at connect/mode-switch time.
      */
-    private suspend fun applyUpstreamMode(aetherReady: Boolean) = engineSwitchMutex.withLock {
+    private suspend fun applyUpstreamMode(chainReady: Boolean, chainMode: UpstreamMode) = engineSwitchMutex.withLock {
         engineSwitchStartedAt = System.currentTimeMillis()
         try {
-            applyUpstreamModeLocked(aetherReady)
+            applyUpstreamModeLocked(chainReady, chainMode)
         } finally {
             engineSwitchStartedAt = 0L
         }
     }
 
-    private fun applyUpstreamModeLocked(aetherReady: Boolean) {
-        val wantHev = aetherReady && HevTunnel.isAvailable()
-        if (wantHev == usingHevEngine) {
+    private fun applyUpstreamModeLocked(chainReady: Boolean, chainMode: UpstreamMode) {
+        val wantHev = chainReady && chainMode != UpstreamMode.NONE && HevTunnel.isAvailable()
+        // hev forwards everything to exactly ONE local SOCKS target - the entry point
+        // of the active chain: Xray's listener for both Xray chains, Aether's otherwise.
+        val hevSocksPort =
+            if (chainMode == UpstreamMode.XRAY) EmbeddedXrayRuntime.SOCKS_PORT else TunnelConfig.SOCKS_PORT
+        if (wantHev == usingHevEngine && (!usingHevEngine || hevSocksPort == activeHevSocksPort)) {
             // Same engine as before: for the JVM router this still needs the mode flag
-            // applied (AETHER when ready but hev unavailable, e.g. native bridge failed
-            // to load - see TProxyService.available - falls back to JVM-relayed AETHER
+            // applied (chain mode when ready but hev unavailable, e.g. native bridge failed
+            // to load - see TProxyService.available - falls back to JVM-relayed chaining
             // exactly like before this feature existed; NONE otherwise).
             if (!usingHevEngine) {
-                packetRouter?.setUpstreamMode(if (aetherReady) UpstreamMode.AETHER else UpstreamMode.NONE)
+                packetRouter?.setUpstreamMode(if (chainReady) chainMode else UpstreamMode.NONE)
             }
             return
         }
         val iface = vpnInterface ?: return
 
         if (wantHev) {
+            if (usingHevEngine) {
+                // Live switch between chain entry points (e.g. AETHER <-> XRAY while
+                // connected): hev reads its SOCKS target once at start, so it must be
+                // restarted against the new local listener.
+                DiagnosticsLog.i("tunnel", "Restarting hev-socks5-tunnel for new chain SOCKS port $hevSocksPort")
+                HevTunnel.stop()
+                usingHevEngine = false
+            }
             DiagnosticsLog.i("tunnel", "Switching TUN engine: JVM router -> native hev-socks5-tunnel")
             packetRouter?.stop()
             packetRouter = null
-            val configPath = HevConfig.write(applicationContext, HEV_MTU)
+            val configPath = HevConfig.write(applicationContext, HEV_MTU, hevSocksPort)
             try {
                 HevTunnel.start(configPath, iface.fd)
                 lastHevTotalBytes = 0L
+                activeHevSocksPort = hevSocksPort
                 usingHevEngine = true
             } catch (e: Exception) {
                 // hev refused to start (bad config/fd) - fall back to the JVM router with
@@ -564,18 +628,64 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         val choice = EmbeddedAetherRuntime.readUpstreamChoice(applicationContext)
         when (choice) {
             EmbeddedAetherRuntime.UpstreamChoice.AETHER -> {
-                if (!EmbeddedAetherRuntime.isRunning()) {
-                    val profile = profileStore.profile.first().copy(proxyMode = true)
-                    AppLogger.log("VpnService", "applyUpstreamChoice: starting Aether")
-                    EmbeddedAetherRuntime.start(applicationContext, profile)
+                stopXrayIfRunning("choice=AETHER")
+                startAetherIfNeeded()
+            }
+            EmbeddedAetherRuntime.UpstreamChoice.XRAY -> {
+                // Direct + Xray: Xray's outbound dials straight through the bonding
+                // boundary; Aether plays no part in this chain.
+                stopAetherIfRunning("choice=XRAY")
+                if (EmbeddedXrayRuntime.needsRestart(applicationContext, BondingSocksServer.PORT)) {
+                    AppLogger.log("VpnService", "applyUpstreamChoice: restarting Xray (stale chain/config)")
+                    EmbeddedXrayRuntime.stop()
+                }
+                if (!EmbeddedXrayRuntime.isRunning()) {
+                    AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Xray)")
+                    EmbeddedXrayRuntime.start(applicationContext, chainPort = BondingSocksServer.PORT)
+                }
+            }
+            EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY -> {
+                // Direct + Aether + Xray: Aether first; Xray is launched by
+                // onChainReadinessChanged() the moment Aether reports trafficReady,
+                // because Xray's outbound dials through Aether's SOCKS listener.
+                if (EmbeddedXrayRuntime.needsRestart(applicationContext, TunnelConfig.SOCKS_PORT)) {
+                    AppLogger.log("VpnService", "applyUpstreamChoice: restarting Xray (stale chain/config)")
+                    EmbeddedXrayRuntime.stop()
+                }
+                startAetherIfNeeded()
+                if (EmbeddedAetherRuntime.isTrafficReady() && !EmbeddedXrayRuntime.isRunning()) {
+                    // Aether was already carrying traffic (e.g. switching AETHER ->
+                    // AETHER_XRAY live): trafficReady won't re-emit, start Xray now.
+                    AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Aether + Xray)")
+                    EmbeddedXrayRuntime.start(applicationContext, chainPort = TunnelConfig.SOCKS_PORT)
                 }
             }
             EmbeddedAetherRuntime.UpstreamChoice.NONE -> {
-                if (EmbeddedAetherRuntime.isRunning()) {
-                    AppLogger.log("VpnService", "applyUpstreamChoice: stopping Aether")
-                    EmbeddedAetherRuntime.stop(applicationContext)
-                }
+                stopXrayIfRunning("choice=NONE")
+                stopAetherIfRunning("choice=NONE")
             }
+        }
+    }
+
+    private suspend fun startAetherIfNeeded() {
+        if (!EmbeddedAetherRuntime.isRunning()) {
+            val profile = profileStore.profile.first().copy(proxyMode = true)
+            AppLogger.log("VpnService", "applyUpstreamChoice: starting Aether")
+            EmbeddedAetherRuntime.start(applicationContext, profile)
+        }
+    }
+
+    private fun stopAetherIfRunning(reason: String) {
+        if (EmbeddedAetherRuntime.isRunning()) {
+            AppLogger.log("VpnService", "applyUpstreamChoice: stopping Aether ($reason)")
+            EmbeddedAetherRuntime.stop(applicationContext)
+        }
+    }
+
+    private fun stopXrayIfRunning(reason: String) {
+        if (EmbeddedXrayRuntime.isRunning()) {
+            AppLogger.log("VpnService", "applyUpstreamChoice: stopping Xray ($reason)")
+            EmbeddedXrayRuntime.stop()
         }
     }
 
@@ -759,12 +869,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 path3Router.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 packetRouter?.updateWeights(weights.wifiWeight, weights.cellularWeight)
                 bondingUpstream?.updateWeights(weights.wifiWeight, weights.cellularWeight)
-                packetRouter?.setUpstreamMode(
-                    when {
-                        EmbeddedAetherRuntime.isTrafficReady() -> UpstreamMode.AETHER
-                        else -> UpstreamMode.NONE
-                    }
-                )
+                currentChainState().let { (chainMode, chainReady) ->
+                    packetRouter?.setUpstreamMode(if (chainReady) chainMode else UpstreamMode.NONE)
+                }
 
                 val mode = when {
                     wifiOk && cellularOk -> BondingMode.BONDING_ACTIVE
@@ -980,6 +1087,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         DynamicWeightCalculator.clear()
         BondingStatus.reset()
 
+        // Chain order on teardown: Xray first (it is downstream of Aether in the
+        // Direct+Aether+Xray chain), then Aether.
+        EmbeddedXrayRuntime.stop()
         // Ensure Aether state is properly reset when VPN stops
         EmbeddedAetherRuntime.stop(applicationContext)
     }

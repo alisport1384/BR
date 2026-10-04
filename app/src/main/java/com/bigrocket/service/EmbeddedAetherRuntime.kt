@@ -35,8 +35,13 @@ object EmbeddedAetherRuntime {
      * lifecycle must be Service-owned, not Activity-owned, or a recreated/reopened Activity
      * can race a healthy running engine - which is exactly what previously caused the
      * reconnect flap on reopening the app).
+     *
+     * [XRAY] = Direct + Xray (TUN traffic → Xray → bonding boundary → physical paths).
+     * [AETHER_XRAY] = Direct + Aether + Xray (TUN traffic → Xray → Aether → bonding
+     * boundary → physical paths). Both are orchestrated by BigRocketVpnService's
+     * applyUpstreamChoice(), exactly like NONE/AETHER.
      */
-    enum class UpstreamChoice { NONE, AETHER }
+    enum class UpstreamChoice { NONE, AETHER, XRAY, AETHER_XRAY }
 
     /** Synchronous on purpose - see loadUpstreamChoice()'s callers for why. */
     fun readUpstreamChoice(context: Context): UpstreamChoice {

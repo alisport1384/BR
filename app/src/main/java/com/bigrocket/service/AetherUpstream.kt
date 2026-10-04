@@ -10,19 +10,28 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 
-/** Local SOCKS5 adapter used only when BigRocket -> Aether chaining is active. */
+/**
+ * Local SOCKS5 adapter used when BigRocket chains relayed traffic through an embedded
+ * upstream engine. Defaults to Aether's listener (1819); [proxyPort] lets the same
+ * (protocol-identical) SOCKS5 client reach Xray's local listener for the Xray chains.
+ */
 object AetherUpstream {
     private const val HOST = "127.0.0.1"
     private const val PORT = 1819
     private const val TIMEOUT_MS = 5000
 
-    fun openTcp(vpnService: VpnService, destinationHost: String, destinationPort: Int): Socket {
+    fun openTcp(
+        vpnService: VpnService,
+        destinationHost: String,
+        destinationPort: Int,
+        proxyPort: Int = PORT,
+    ): Socket {
         val socket = Socket()
         try {
             vpnService.protect(socket)
             socket.tcpNoDelay = true
             socket.keepAlive = true
-            socket.connect(InetSocketAddress(HOST, PORT), TIMEOUT_MS)
+            socket.connect(InetSocketAddress(HOST, proxyPort), TIMEOUT_MS)
             socket.soTimeout = TIMEOUT_MS
 
             val out = socket.getOutputStream()
@@ -53,13 +62,13 @@ object AetherUpstream {
         }
     }
 
-    fun openUdp(vpnService: VpnService): UdpAssociation {
+    fun openUdp(vpnService: VpnService, proxyPort: Int = PORT): UdpAssociation {
         val control = Socket()
         val udp = DatagramSocket()
         try {
             vpnService.protect(control)
             vpnService.protect(udp)
-            control.connect(InetSocketAddress(HOST, PORT), TIMEOUT_MS)
+            control.connect(InetSocketAddress(HOST, proxyPort), TIMEOUT_MS)
             control.soTimeout = TIMEOUT_MS
 
             val out = control.getOutputStream()

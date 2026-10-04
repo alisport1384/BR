@@ -60,7 +60,7 @@ jobs:
 
       - name: Prepare Aether native sources
         run: |
-          chmod +x scripts/fetch-natives.sh scripts/build-natives.sh
+          chmod +x scripts/fetch-natives.sh scripts/build-natives.sh scripts/build-xray.sh
           scripts/fetch-natives.sh
 
       - name: Build Aether native cores
@@ -68,6 +68,17 @@ jobs:
           ANDROID_API: 26
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
         run: scripts/build-natives.sh all
+
+      - name: Set up Go (Xray core)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build Xray core
+        env:
+          ANDROID_API: 26
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+        run: scripts/build-xray.sh
 
       - name: Grant Execute Permission to Gradle Wrapper
         run: chmod +x ./gradlew

@@ -12,7 +12,12 @@ import java.io.File
  * VpnService.Builder, whose fd is handed to TProxyStartService separately.
  */
 object HevConfig {
-    fun write(context: Context, mtu: Int): String {
+    /**
+     * [socksPort] defaults to Aether's listener; BigRocket's Xray chains pass
+     * Xray's local SOCKS port instead so hev feeds whichever embedded engine
+     * is the active entry point of the upstream chain.
+     */
+    fun write(context: Context, mtu: Int, socksPort: Int = TunnelConfig.SOCKS_PORT): String {
         val yaml = """
             tunnel:
               mtu: $mtu
@@ -21,7 +26,7 @@ object HevConfig {
               ipv4: 10.0.0.2/24
 
             socks5:
-              port: ${TunnelConfig.SOCKS_PORT}
+              port: $socksPort
               address: '${TunnelConfig.SOCKS_HOST}'
               udp: 'udp'
 

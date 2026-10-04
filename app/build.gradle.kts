@@ -61,6 +61,13 @@ tasks.register("verifyAetherEngineAssets") {
             if (!engine.isFile || engine.length() == 0L) {
                 throw GradleException("Missing Aether engine asset for $abi: ${engine.absolutePath}")
             }
+            // The Xray core (BigRocket's Direct+Xray / Direct+Aether+Xray chains) is
+            // spawned from nativeLibraryDir exactly like libaether.so, so it must be
+            // present in jniLibs for every shipped ABI - built by scripts/build-xray.sh.
+            val xray = file("src/main/jniLibs/$abi/libxray.so")
+            if (!xray.isFile || xray.length() == 0L) {
+                throw GradleException("Missing Xray core binary for $abi: ${xray.absolutePath} (run scripts/build-xray.sh)")
+            }
         }
     }
 }
@@ -91,6 +98,9 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation(libs.kotlinx.coroutines.core)
+    // XrayConfigBuilder uses Android's bundled org.json; plain-JVM unit tests need it
+    // as an explicit dependency (test-only, never packaged).
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 

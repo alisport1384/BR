@@ -34,6 +34,8 @@ import androidx.compose.runtime.setValue
 import studio.cluvex.aether.data.ProfileStore
 import studio.cluvex.aether.model.ConnectionProfile
 import com.bigrocket.service.EmbeddedAetherRuntime
+import com.bigrocket.service.XrayConfigBuilder
+import com.bigrocket.service.XrayConfigStore
 import com.bigrocket.service.DynamicWeightCalculator
 import com.bigrocket.service.NetworkPreferenceStore
 import com.bigrocket.service.AppLogger
@@ -70,6 +72,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvAetherMode: TextView
     private lateinit var spinnerAetherMode: Spinner
     private lateinit var aetherEmbeddedPanel: ComposeView
+    private lateinit var xrayConfigSection: LinearLayout
+    private lateinit var etXrayConfig: android.widget.EditText
+    private lateinit var btnSaveXrayConfig: Button
     private lateinit var toolbar: Toolbar
     private var upstreamChoice = UpstreamChoice.NONE
     // Backed by Compose state (not a plain var): AetherEmbeddedPanel reads this inside
@@ -165,6 +170,41 @@ class MainActivity : AppCompatActivity() {
         tvAetherMode = findViewById(R.id.tvAetherMode)
         spinnerAetherMode = findViewById(R.id.spinnerAetherMode)
         aetherEmbeddedPanel = findViewById(R.id.aetherEmbeddedPanel)
+        xrayConfigSection = findViewById(R.id.xrayConfigSection)
+        etXrayConfig = findViewById(R.id.etXrayConfig)
+        btnSaveXrayConfig = findViewById(R.id.btnSaveXrayConfig)
+        setupXrayConfigControls()
+    }
+
+    private fun setupXrayConfigControls() {
+        XrayConfigStore.read(this)?.let { etXrayConfig.setText(it) }
+        btnSaveXrayConfig.setOnClickListener {
+            val raw = etXrayConfig.text?.toString()?.trim().orEmpty()
+            if (raw.isEmpty()) {
+                Toast.makeText(this, "کانفیگ Xray خالی است", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            // Validate by actually building the runtime config (ports are irrelevant
+            // for validation) so a broken paste is rejected here, not at connect time.
+            try {
+                XrayConfigBuilder.build(raw, 1, 2)
+            } catch (e: Exception) {
+                Toast.makeText(this, e.message ?: "کانفیگ Xray نامعتبر است", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            XrayConfigStore.save(this, raw)
+            Toast.makeText(this, "کانفیگ Xray ذخیره شد", Toast.LENGTH_SHORT).show()
+            // If an Xray chain is live, the Service re-checks and restarts the core
+            // against the new config (see EmbeddedXrayRuntime.needsRestart).
+            if (BigRocketVpnService.runningInstance != null &&
+                (upstreamChoice == UpstreamChoice.XRAY || upstreamChoice == UpstreamChoice.AETHER_XRAY)
+            ) {
+                startService(
+                    Intent(this, BigRocketVpnService::class.java)
+                        .setAction(BigRocketVpnService.ACTION_UPSTREAM_CHANGED)
+                )
+            }
+        }
     }
 
     private fun setupNetworkScoreControls() {
@@ -244,7 +284,18 @@ class MainActivity : AppCompatActivity() {
                             lifecycleScope.launch { aetherProfileStore.save(profile) }
                         },
                         enabled = aetherRuntimeEnabled,
-                        onEnabledChange = { selected -> setUpstreamChoice(if (selected) UpstreamChoice.AETHER else UpstreamChoice.NONE) },
+                        onEnabledChange = { selected ->
+                            // Inside the Direct+Aether+Xray chain this toggle only governs the
+                            // Aether stage: off collapses the chain to Direct+Xray, it never
+                            // silently drops the Xray stage the user explicitly selected.
+                            val target = when {
+                                selected && upstreamChoice == UpstreamChoice.AETHER_XRAY -> UpstreamChoice.AETHER_XRAY
+                                selected -> UpstreamChoice.AETHER
+                                upstreamChoice == UpstreamChoice.AETHER_XRAY -> UpstreamChoice.XRAY
+                                else -> UpstreamChoice.NONE
+                            }
+                            setUpstreamChoice(target)
+                        },
                     )
                 }
             }
@@ -256,7 +307,7 @@ class MainActivity : AppCompatActivity() {
 
 
 
-        val options = arrayOf("فقط BigRocket", "BigRocket + Aether")
+        val options = arrayOf("فقط BigRocket", "BigRocket + Aether", "Direct + Xray", "Direct + Aether + Xray")
         spinnerAetherMode.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, options)
         // A Spinner ALWAYS fires onItemSelected once after layout with whatever position is
         // selected at that moment - it is not a user action. A fresh adapter defaults to
@@ -266,12 +317,14 @@ class MainActivity : AppCompatActivity() {
         // the app was opened (connection alive until entering the app, dropped on entering).
         // Selecting the restored position BEFORE attaching the listener makes that phantom
         // callback a no-op (setUpstreamChoice returns early when the choice is unchanged).
-        spinnerAetherMode.setSelection(if (upstreamChoice == UpstreamChoice.AETHER) 1 else 0, false)
+        spinnerAetherMode.setSelection(spinnerPositionFor(upstreamChoice), false)
         spinnerAetherMode.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
             override fun onItemSelected(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                 val selected = when (position) {
                     1 -> UpstreamChoice.AETHER
+                    2 -> UpstreamChoice.XRAY
+                    3 -> UpstreamChoice.AETHER_XRAY
                     else -> UpstreamChoice.NONE
                 }
                 setUpstreamChoice(selected)
@@ -291,6 +344,12 @@ class MainActivity : AppCompatActivity() {
         upstreamChoice = choice
         saveUpstreamChoice(choice)
         renderUpstreamChoice()
+        // Keep the mode spinner consistent when the choice changes from somewhere else
+        // (e.g. the Aether panel toggle). The phantom onItemSelected this triggers is a
+        // no-op: setUpstreamChoice returns early on an unchanged choice.
+        if (spinnerAetherMode.selectedItemPosition != spinnerPositionFor(choice)) {
+            spinnerAetherMode.setSelection(spinnerPositionFor(choice), false)
+        }
 
         // The Service owns the engine's actual start/stop now (see applyUpstreamChoice() in
         // BigRocketVpnService) - this only wakes it up to re-check the choice we just saved,
@@ -307,15 +366,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveUpstreamChoice(choice: UpstreamChoice) = EmbeddedAetherRuntime.saveUpstreamChoice(this, choice)
 
+    private fun spinnerPositionFor(choice: UpstreamChoice): Int = when (choice) {
+        UpstreamChoice.NONE -> 0
+        UpstreamChoice.AETHER -> 1
+        UpstreamChoice.XRAY -> 2
+        UpstreamChoice.AETHER_XRAY -> 3
+    }
+
     private fun renderUpstreamChoice() {
         tvAetherMode.text = when (upstreamChoice) {
             UpstreamChoice.AETHER -> "مسیر بعد از Bonding: BigRocket → Aether"
+            UpstreamChoice.XRAY -> "مسیر بعد از Bonding: BigRocket → Xray"
+            UpstreamChoice.AETHER_XRAY -> "مسیر بعد از Bonding: BigRocket → Aether → Xray"
             UpstreamChoice.NONE -> "مسیر بعد از Bonding: فقط BigRocket"
         }
-        // Aether's settings panel only makes sense once BigRocket + Aether is actually
-        // selected - showing it unconditionally exposed knobs (protocol, scan mode, ...)
+        // Aether's settings panel only makes sense while Aether is part of the active
+        // chain - showing it unconditionally exposed knobs (protocol, scan mode, ...)
         // for an engine that wasn't even the active upstream.
-        aetherEmbeddedPanel.visibility = if (upstreamChoice == UpstreamChoice.AETHER) View.VISIBLE else View.GONE
+        val usesAether = upstreamChoice == UpstreamChoice.AETHER || upstreamChoice == UpstreamChoice.AETHER_XRAY
+        aetherEmbeddedPanel.visibility = if (usesAether) View.VISIBLE else View.GONE
+        // Same reasoning for the Xray config input: only visible for the Xray chains.
+        val usesXray = upstreamChoice == UpstreamChoice.XRAY || upstreamChoice == UpstreamChoice.AETHER_XRAY
+        xrayConfigSection.visibility = if (usesXray) View.VISIBLE else View.GONE
     }
 
 

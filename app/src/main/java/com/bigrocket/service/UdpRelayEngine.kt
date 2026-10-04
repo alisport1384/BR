@@ -80,7 +80,11 @@ class UdpRelayEngine(
                 // instead of holding their file descriptor open forever.
                 socket.soTimeout = UDP_IDLE_TIMEOUT_MS.toInt()
 
-                val aetherAssociation = if (mode == UpstreamMode.AETHER) AetherUpstream.openUdp(vpnService) else null
+                val aetherAssociation = when (mode) {
+                    UpstreamMode.AETHER -> AetherUpstream.openUdp(vpnService)
+                    UpstreamMode.XRAY -> AetherUpstream.openUdp(vpnService, proxyPort = EmbeddedXrayRuntime.SOCKS_PORT)
+                    UpstreamMode.NONE -> null
+                }
                 session = UdpSession(socket, targetNetwork, aetherAssociation, System.currentTimeMillis())
                 activeSessions[key] = session
 
