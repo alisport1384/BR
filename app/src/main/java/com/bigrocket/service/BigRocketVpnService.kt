@@ -230,15 +230,28 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             AppLogger.log("VpnService", "Aether ready - starting Xray stage of Direct+Aether+Xray chain")
             EmbeddedXrayRuntime.start(applicationContext, chainPort = TunnelConfig.SOCKS_PORT)
         }
+        // Mirror image of the above for Direct+Xray+Aether: there Aether rides on top
+        // of Xray, so Aether may only be launched once Xray is actually carrying
+        // traffic - its outbound dials through Xray's local SOCKS listener.
+        if (isRunning &&
+            choice == EmbeddedAetherRuntime.UpstreamChoice.XRAY_AETHER &&
+            xrayReady &&
+            !EmbeddedAetherRuntime.isRunning()
+        ) {
+            AppLogger.log("VpnService", "Xray ready - starting Aether stage of Direct+Xray+Aether chain")
+            startAetherIfNeeded(upstreamPort = EmbeddedXrayRuntime.SOCKS_PORT)
+        }
         val (chainMode, chainReady) = currentChainState(aetherReady, xrayReady)
         applyUpstreamMode(chainReady, chainMode)
     }
 
     /**
      * Single source of truth for "which local SOCKS entry point should carry TUN
-     * traffic right now, and is it ready?". For both Xray chains the entry point
-     * is Xray's listener; whether Xray then dials via the bonding boundary or via
-     * Aether is fixed inside its generated config, not here.
+     * traffic right now, and is it ready?". The entry point is whichever engine
+     * sits LAST before the TUN side of the chain: Xray's listener when Xray is the
+     * outermost stage (XRAY / AETHER_XRAY), Aether's listener when Aether is
+     * (AETHER / XRAY_AETHER). What that engine then dials through - the bonding
+     * boundary, Aether, or Xray - is fixed by its own startup config, not here.
      */
     private fun currentChainState(
         aetherReady: Boolean = EmbeddedAetherRuntime.isTrafficReady(),
@@ -249,6 +262,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         EmbeddedAetherRuntime.UpstreamChoice.XRAY -> UpstreamMode.XRAY to xrayReady
         EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY ->
             UpstreamMode.XRAY to (aetherReady && xrayReady)
+        EmbeddedAetherRuntime.UpstreamChoice.XRAY_AETHER ->
+            UpstreamMode.AETHER to (aetherReady && xrayReady)
     }
 
     /**
@@ -629,6 +644,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         when (choice) {
             EmbeddedAetherRuntime.UpstreamChoice.AETHER -> {
                 stopXrayIfRunning("choice=AETHER")
+                if (EmbeddedAetherRuntime.needsRestart(BondingSocksServer.PORT)) {
+                    stopAetherIfRunning("stale upstream chain")
+                }
                 startAetherIfNeeded()
             }
             EmbeddedAetherRuntime.UpstreamChoice.XRAY -> {
@@ -652,12 +670,41 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                     AppLogger.log("VpnService", "applyUpstreamChoice: restarting Xray (stale chain/config)")
                     EmbeddedXrayRuntime.stop()
                 }
+                if (EmbeddedAetherRuntime.needsRestart(BondingSocksServer.PORT)) {
+                    stopAetherIfRunning("stale upstream chain")
+                }
                 startAetherIfNeeded()
                 if (EmbeddedAetherRuntime.isTrafficReady() && !EmbeddedXrayRuntime.isRunning()) {
                     // Aether was already carrying traffic (e.g. switching AETHER ->
                     // AETHER_XRAY live): trafficReady won't re-emit, start Xray now.
                     AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Aether + Xray)")
                     EmbeddedXrayRuntime.start(applicationContext, chainPort = TunnelConfig.SOCKS_PORT)
+                }
+            }
+            EmbeddedAetherRuntime.UpstreamChoice.XRAY_AETHER -> {
+                // Direct + Xray + Aether: exact mirror of AETHER_XRAY. Xray first,
+                // chained straight to the bonding boundary; Aether is launched by
+                // onChainReadinessChanged() the moment Xray reports trafficReady,
+                // because Aether's outbound dials through Xray's SOCKS listener.
+                if (EmbeddedAetherRuntime.needsRestart(EmbeddedXrayRuntime.SOCKS_PORT)) {
+                    stopAetherIfRunning("stale upstream chain")
+                }
+                if (EmbeddedXrayRuntime.needsRestart(applicationContext, BondingSocksServer.PORT)) {
+                    AppLogger.log("VpnService", "applyUpstreamChoice: restarting Xray (stale chain/config)")
+                    // Aether rides on top of Xray here: restarting Xray underneath a
+                    // live Aether would leave Aether's tunnel dialing a dead listener.
+                    stopAetherIfRunning("Xray stage restarting underneath")
+                    EmbeddedXrayRuntime.stop()
+                }
+                if (!EmbeddedXrayRuntime.isRunning()) {
+                    AppLogger.log("VpnService", "applyUpstreamChoice: starting Xray (Direct + Xray + Aether)")
+                    EmbeddedXrayRuntime.start(applicationContext, chainPort = BondingSocksServer.PORT)
+                }
+                if (EmbeddedXrayRuntime.isTrafficReady() && !EmbeddedAetherRuntime.isRunning()) {
+                    // Xray was already carrying traffic (e.g. switching XRAY ->
+                    // XRAY_AETHER live): trafficReady won't re-emit, start Aether now.
+                    AppLogger.log("VpnService", "applyUpstreamChoice: starting Aether (Direct + Xray + Aether)")
+                    startAetherIfNeeded(upstreamPort = EmbeddedXrayRuntime.SOCKS_PORT)
                 }
             }
             EmbeddedAetherRuntime.UpstreamChoice.NONE -> {
@@ -667,11 +714,11 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         }
     }
 
-    private suspend fun startAetherIfNeeded() {
+    private suspend fun startAetherIfNeeded(upstreamPort: Int = BondingSocksServer.PORT) {
         if (!EmbeddedAetherRuntime.isRunning()) {
             val profile = profileStore.profile.first().copy(proxyMode = true)
-            AppLogger.log("VpnService", "applyUpstreamChoice: starting Aether")
-            EmbeddedAetherRuntime.start(applicationContext, profile)
+            AppLogger.log("VpnService", "applyUpstreamChoice: starting Aether (upstreamPort=$upstreamPort)")
+            EmbeddedAetherRuntime.start(applicationContext, profile, upstreamPort)
         }
     }
 
@@ -1087,8 +1134,9 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
         DynamicWeightCalculator.clear()
         BondingStatus.reset()
 
-        // Chain order on teardown: Xray first (it is downstream of Aether in the
-        // Direct+Aether+Xray chain), then Aether.
+        // Both embedded engines are stopped back-to-back regardless of which chain was
+        // active (Xray rides on Aether in AETHER_XRAY, Aether rides on Xray in
+        // XRAY_AETHER) - the whole chain is coming down, so inter-stage order is moot.
         EmbeddedXrayRuntime.stop()
         // Ensure Aether state is properly reset when VPN stops
         EmbeddedAetherRuntime.stop(applicationContext)

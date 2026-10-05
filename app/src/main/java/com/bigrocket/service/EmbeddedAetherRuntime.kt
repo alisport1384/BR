@@ -38,10 +38,13 @@ object EmbeddedAetherRuntime {
      *
      * [XRAY] = Direct + Xray (TUN traffic → Xray → bonding boundary → physical paths).
      * [AETHER_XRAY] = Direct + Aether + Xray (TUN traffic → Xray → Aether → bonding
-     * boundary → physical paths). Both are orchestrated by BigRocketVpnService's
+     * boundary → physical paths). [XRAY_AETHER] = Direct + Xray + Aether (TUN traffic
+     * → Aether → Xray → bonding boundary → physical paths: Aether is the chain entry
+     * point and its own outbound dials through Xray's local SOCKS instead of the
+     * bonding boundary directly). All are orchestrated by BigRocketVpnService's
      * applyUpstreamChoice(), exactly like NONE/AETHER.
      */
-    enum class UpstreamChoice { NONE, AETHER, XRAY, AETHER_XRAY }
+    enum class UpstreamChoice { NONE, AETHER, XRAY, AETHER_XRAY, XRAY_AETHER }
 
     /** Synchronous on purpose - see loadUpstreamChoice()'s callers for why. */
     fun readUpstreamChoice(context: Context): UpstreamChoice {
@@ -62,21 +65,29 @@ object EmbeddedAetherRuntime {
     private val _trafficReady = MutableStateFlow(false)
     val trafficReady: StateFlow<Boolean> = _trafficReady.asStateFlow()
 
-    fun start(context: Context, profile: ConnectionProfile) {
+    // Which local SOCKS port the LIVE engine chains its own outbound through
+    // (BondingSocksServer.PORT, or Xray's listener in the Direct+Xray+Aether chain).
+    // Lets applyUpstreamChoice() detect a stale instance after a chain switch.
+    @Volatile private var activeUpstreamPort = -1
+
+    fun start(context: Context, profile: ConnectionProfile, upstreamPort: Int = BondingSocksServer.PORT) {
         if (job?.isActive == true) return
         _enabled.value = true
         _trafficReady.value = false
         val app = context.applicationContext
+        activeUpstreamPort = upstreamPort
         job = scope.launch {
             runCatching {
                 AetherController.setState(ConnectionState.Launching)
                 EngineMeta.reset()
                 // Aether must consume BigRocket's already-bonded transport. Its own
-                // physical dials are therefore chained through the local SOCKS5
-                // bonding boundary instead of going directly to Wi-Fi/Cellular.
+                // physical dials are therefore chained through a local SOCKS5 boundary
+                // instead of going directly to Wi-Fi/Cellular: the bonding boundary
+                // itself by default, or Xray's listener when Aether rides on top of
+                // Xray in the Direct+Xray+Aether chain.
                 val embeddedProfile = profile.copy(
                     proxyMode = true,
-                    upstreamProxy = "socks5://127.0.0.1:${BondingSocksServer.PORT}"
+                    upstreamProxy = "socks5://127.0.0.1:$upstreamPort"
                 )
                 ProfileStore(app).save(embeddedProfile)
                 val engine = AetherProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
@@ -127,9 +138,16 @@ object EmbeddedAetherRuntime {
         job?.cancel()
         job = null
         stopInternal()
+        activeUpstreamPort = -1
         AetherController.setState(ConnectionState.Idle)
         EngineMeta.reset()
     }
+
+    /**
+     * True when the live engine's own outbound no longer chains through the SOCKS
+     * port the desired chain requires, so the caller must stop() before start().
+     */
+    fun needsRestart(upstreamPort: Int): Boolean = isRunning() && upstreamPort != activeUpstreamPort
 
     private fun stopInternal() {
         runCatching { process?.stop() }

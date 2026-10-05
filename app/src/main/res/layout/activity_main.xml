@@ -333,7 +333,7 @@
                 android:id="@+id/tvAetherMode"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="مسیر بعد از Bonding: فقط BigRocket"
+                android:text="مسیر بعد از Bonding: Direct"
                 android:textColor="@color/br_text_primary"
                 android:textSize="14sp" />
 

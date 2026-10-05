@@ -197,7 +197,9 @@ class MainActivity : AppCompatActivity() {
             // If an Xray chain is live, the Service re-checks and restarts the core
             // against the new config (see EmbeddedXrayRuntime.needsRestart).
             if (BigRocketVpnService.runningInstance != null &&
-                (upstreamChoice == UpstreamChoice.XRAY || upstreamChoice == UpstreamChoice.AETHER_XRAY)
+                (upstreamChoice == UpstreamChoice.XRAY ||
+                    upstreamChoice == UpstreamChoice.AETHER_XRAY ||
+                    upstreamChoice == UpstreamChoice.XRAY_AETHER)
             ) {
                 startService(
                     Intent(this, BigRocketVpnService::class.java)
@@ -285,13 +287,16 @@ class MainActivity : AppCompatActivity() {
                         },
                         enabled = aetherRuntimeEnabled,
                         onEnabledChange = { selected ->
-                            // Inside the Direct+Aether+Xray chain this toggle only governs the
-                            // Aether stage: off collapses the chain to Direct+Xray, it never
-                            // silently drops the Xray stage the user explicitly selected.
+                            // Inside the combined chains this toggle only governs the Aether
+                            // stage: off collapses Direct+Aether+Xray / Direct+Xray+Aether to
+                            // Direct+Xray, it never silently drops the Xray stage the user
+                            // explicitly selected.
                             val target = when {
                                 selected && upstreamChoice == UpstreamChoice.AETHER_XRAY -> UpstreamChoice.AETHER_XRAY
+                                selected && upstreamChoice == UpstreamChoice.XRAY_AETHER -> UpstreamChoice.XRAY_AETHER
                                 selected -> UpstreamChoice.AETHER
-                                upstreamChoice == UpstreamChoice.AETHER_XRAY -> UpstreamChoice.XRAY
+                                upstreamChoice == UpstreamChoice.AETHER_XRAY ||
+                                    upstreamChoice == UpstreamChoice.XRAY_AETHER -> UpstreamChoice.XRAY
                                 else -> UpstreamChoice.NONE
                             }
                             setUpstreamChoice(target)
@@ -307,7 +312,7 @@ class MainActivity : AppCompatActivity() {
 
 
 
-        val options = arrayOf("فقط BigRocket", "BigRocket + Aether", "Direct + Xray", "Direct + Aether + Xray")
+        val options = arrayOf("Direct", "Direct + Aether", "Direct + Xray", "Direct + Aether + Xray", "Direct + Xray + Aether")
         spinnerAetherMode.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, options)
         // A Spinner ALWAYS fires onItemSelected once after layout with whatever position is
         // selected at that moment - it is not a user action. A fresh adapter defaults to
@@ -325,6 +330,7 @@ class MainActivity : AppCompatActivity() {
                     1 -> UpstreamChoice.AETHER
                     2 -> UpstreamChoice.XRAY
                     3 -> UpstreamChoice.AETHER_XRAY
+                    4 -> UpstreamChoice.XRAY_AETHER
                     else -> UpstreamChoice.NONE
                 }
                 setUpstreamChoice(selected)
@@ -371,22 +377,28 @@ class MainActivity : AppCompatActivity() {
         UpstreamChoice.AETHER -> 1
         UpstreamChoice.XRAY -> 2
         UpstreamChoice.AETHER_XRAY -> 3
+        UpstreamChoice.XRAY_AETHER -> 4
     }
 
     private fun renderUpstreamChoice() {
         tvAetherMode.text = when (upstreamChoice) {
-            UpstreamChoice.AETHER -> "مسیر بعد از Bonding: BigRocket → Aether"
-            UpstreamChoice.XRAY -> "مسیر بعد از Bonding: BigRocket → Xray"
-            UpstreamChoice.AETHER_XRAY -> "مسیر بعد از Bonding: BigRocket → Aether → Xray"
-            UpstreamChoice.NONE -> "مسیر بعد از Bonding: فقط BigRocket"
+            UpstreamChoice.AETHER -> "مسیر بعد از Bonding: Direct → Aether"
+            UpstreamChoice.XRAY -> "مسیر بعد از Bonding: Direct → Xray"
+            UpstreamChoice.AETHER_XRAY -> "مسیر بعد از Bonding: Direct → Aether → Xray"
+            UpstreamChoice.XRAY_AETHER -> "مسیر بعد از Bonding: Direct → Xray → Aether"
+            UpstreamChoice.NONE -> "مسیر بعد از Bonding: Direct"
         }
         // Aether's settings panel only makes sense while Aether is part of the active
         // chain - showing it unconditionally exposed knobs (protocol, scan mode, ...)
         // for an engine that wasn't even the active upstream.
-        val usesAether = upstreamChoice == UpstreamChoice.AETHER || upstreamChoice == UpstreamChoice.AETHER_XRAY
+        val usesAether = upstreamChoice == UpstreamChoice.AETHER ||
+            upstreamChoice == UpstreamChoice.AETHER_XRAY ||
+            upstreamChoice == UpstreamChoice.XRAY_AETHER
         aetherEmbeddedPanel.visibility = if (usesAether) View.VISIBLE else View.GONE
         // Same reasoning for the Xray config input: only visible for the Xray chains.
-        val usesXray = upstreamChoice == UpstreamChoice.XRAY || upstreamChoice == UpstreamChoice.AETHER_XRAY
+        val usesXray = upstreamChoice == UpstreamChoice.XRAY ||
+            upstreamChoice == UpstreamChoice.AETHER_XRAY ||
+            upstreamChoice == UpstreamChoice.XRAY_AETHER
         xrayConfigSection.visibility = if (usesXray) View.VISIBLE else View.GONE
     }
 
