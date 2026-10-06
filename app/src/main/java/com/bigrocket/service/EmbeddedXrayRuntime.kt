@@ -77,7 +77,10 @@ object EmbeddedXrayRuntime {
                 AppLogger.log("Xray", "core ready on $SOCKS_HOST:$SOCKS_PORT (chainPort=$chainPort)")
                 _trafficReady.value = true
             }.onFailure {
-                AppLogger.logError("Xray", "start failed", Exception(it))
+                // it is already a Throwable (runCatching) - wrapping it in another Exception
+                // would relabel the logged error's type as generic "Exception" and bury the
+                // real one (e.g. IllegalStateException from the error()s above) as .cause.
+                AppLogger.logError("Xray", "start failed", it)
                 _trafficReady.value = false
                 stopInternal()
             }
