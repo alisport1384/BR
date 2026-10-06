@@ -22,7 +22,11 @@ JNI_DIR="${PROJECT_DIR}/app/src/main/jniLibs"
 
 API="${ANDROID_API:-26}"
 XRAY_REPO="${XRAY_REPO:-XTLS/Xray-core}"
-XRAY_REF="${XRAY_REF:-}"
+# Pinned, not blank: an unpinned default silently tracks whatever XTLS/Xray-core's default
+# branch is on the day CI happens to run - any upstream breaking change (CLI flags, config
+# schema) would then land in a BigRocket build nobody chose to take. Bump this deliberately
+# when upgrading, the same way CORE_VERSION is bumped for Aether.
+XRAY_REF="${XRAY_REF:-v26.9.30}"
 
 GH="https://""github.com"
 
