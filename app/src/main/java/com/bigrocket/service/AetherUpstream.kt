@@ -57,6 +57,11 @@ object AetherUpstream {
             socket.soTimeout = 0
             return socket
         } catch (e: Exception) {
+            AppLogger.log(
+                "Upstream",
+                "TCP CONNECT $destinationHost:$destinationPort via 127.0.0.1:$proxyPort failed: " +
+                    "${e.javaClass.simpleName}: ${e.message}",
+            )
             runCatching { socket.close() }
             throw e
         }
@@ -83,6 +88,10 @@ object AetherUpstream {
             udp.soTimeout = 1000
             return UdpAssociation(control, udp, bound)
         } catch (e: Exception) {
+            AppLogger.log(
+                "Upstream",
+                "UDP ASSOCIATE via 127.0.0.1:$proxyPort failed: ${e.javaClass.simpleName}: ${e.message}",
+            )
             runCatching { control.close() }
             runCatching { udp.close() }
             throw e

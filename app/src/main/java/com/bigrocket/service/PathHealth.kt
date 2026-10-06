@@ -40,10 +40,17 @@ class PathHealthTracker(
     private val failuresToDisconnect: Int,
     private val successesToRecover: Int,
     private val activityGraceMs: Long,
-    private val lossWindowSize: Int = 5
+    private val lossWindowSize: Int = 5,
+    /** Name used in the in-app log ("wifi"/"cellular"); blank = keep this tracker silent. */
+    private val label: String = ""
 ) {
     var state: PathHealthState = PathHealthState.ACTIVE
-        private set
+        private set(value) {
+            if (label.isNotEmpty() && value != field) {
+                AppLogger.log("PathHealth", "$label: $field -> $value")
+            }
+            field = value
+        }
     var lastGoodLatencyMs: Long = DEFAULT_LATENCY_MS
         private set
 

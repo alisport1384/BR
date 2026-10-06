@@ -49,11 +49,20 @@ object XrayConfigBuilder {
     fun build(rawConfig: String, inboundPort: Int, chainPort: Int): String {
         val trimmed = rawConfig.trim()
         val proxyOutbound = when {
-            trimmed.startsWith("vless://", ignoreCase = true) -> parseVlessLink(trimmed)
-            trimmed.startsWith("{") -> extractProxyOutbound(JSONObject(trimmed))
-            else -> throw IllegalArgumentException(
-                "پیکربندی Xray نامعتبر است: فقط لینک vless:// یا کانفیگ کامل JSON پشتیبانی می‌شود"
-            )
+            trimmed.startsWith("vless://", ignoreCase = true) -> {
+                AppLogger.log("XrayConfig", "model 1 (vless:// share link) detected")
+                parseVlessLink(trimmed)
+            }
+            trimmed.startsWith("{") -> {
+                AppLogger.log("XrayConfig", "model 2 (full client JSON) detected")
+                extractProxyOutbound(JSONObject(trimmed))
+            }
+            else -> {
+                AppLogger.log("XrayConfig", "config rejected: neither vless:// link nor JSON object")
+                throw IllegalArgumentException(
+                    "پیکربندی Xray نامعتبر است: فقط لینک vless:// یا کانفیگ کامل JSON پشتیبانی می‌شود"
+                )
+            }
         }
 
         proxyOutbound.put("tag", "proxy")
@@ -107,6 +116,16 @@ object XrayConfigBuilder {
                             )
                     )
             )
+        // Operational summary for the in-app log: which server shape the chain uses
+        // (never credentials - no uuid/password is ever logged).
+        val vnext = proxyOutbound.optJSONObject("settings")?.optJSONArray("vnext")?.optJSONObject(0)
+        val net = proxyOutbound.optJSONObject("streamSettings")?.optString("network") ?: "?"
+        AppLogger.log(
+            "XrayConfig",
+            "built: ${proxyOutbound.optString("protocol")}/$net -> " +
+                "${vnext?.optString("address") ?: "?"}:${vnext?.optInt("port") ?: 0}, " +
+                "inbound=127.0.0.1:$inboundPort (udp on), chain dialerProxy -> 127.0.0.1:$chainPort",
+        )
         return config.toString(2)
     }
 
@@ -116,7 +135,10 @@ object XrayConfigBuilder {
 
     private fun extractProxyOutbound(root: JSONObject): JSONObject {
         val outbounds = root.optJSONArray("outbounds")
-            ?: throw IllegalArgumentException("کانفیگ JSON فاقد بخش outbounds است")
+            ?: run {
+                AppLogger.log("XrayConfig", "config rejected: JSON has no outbounds section")
+                throw IllegalArgumentException("کانفیگ JSON فاقد بخش outbounds است")
+            }
         var fallback: JSONObject? = null
         for (i in 0 until outbounds.length()) {
             val outbound = outbounds.optJSONObject(i) ?: continue
@@ -128,7 +150,10 @@ object XrayConfigBuilder {
             if (fallback == null) fallback = outbound
         }
         return fallback?.let { JSONObject(it.toString()) }
-            ?: throw IllegalArgumentException("هیچ outbound پروکسی معتبری در کانفیگ JSON یافت نشد")
+            ?: run {
+                AppLogger.log("XrayConfig", "config rejected: no usable proxy outbound in JSON")
+                throw IllegalArgumentException("هیچ outbound پروکسی معتبری در کانفیگ JSON یافت نشد")
+            }
     }
 
     // ------------------------------------------------------------------

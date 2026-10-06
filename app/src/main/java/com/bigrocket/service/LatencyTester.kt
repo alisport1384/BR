@@ -12,8 +12,14 @@ object LatencyTester {
 
     /** Sentinel returned when the probe genuinely fails (timeout, refused, DNS failure, etc.) -
      *  distinct from any real elapsed-time value, unlike the old 999L which could collide with
-     *  a real (if slow) successful measurement and be misread as a hard failure. */
+    *  a real (if slow) successful measurement and be misread as a hard failure. */
     const val FAILURE: Long = -1L
+
+    /** Failure-log throttle per network: testLossRate fires 8 concurrent probes and the
+     *  weight loop re-probes every second - on a dead path that would be a wall of identical
+     *  lines. One line per network per window keeps the signal without the flood. */
+    private const val FAILURE_LOG_WINDOW_MS = 5_000L
+    private val lastFailureLogMs = java.util.concurrent.ConcurrentHashMap<Network, Long>()
 
     fun testLatency(
         vpnService: BigRocketVpnService,
@@ -32,7 +38,18 @@ object LatencyTester {
                 it.connect(InetSocketAddress(targetHost, port), timeoutMs)
             }
             System.currentTimeMillis() - startTime
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // Successful latencies already surface in the [Weights] update lines; only the
+            // failure (and its concrete reason) is otherwise invisible in the log.
+            val now = System.currentTimeMillis()
+            val last = lastFailureLogMs[network] ?: 0L
+            if (now - last >= FAILURE_LOG_WINDOW_MS) {
+                lastFailureLogMs[network] = now
+                AppLogger.log(
+                    "LatencyProbe",
+                    "probe FAILED on $network -> $targetHost:$port: ${e.javaClass.simpleName}: ${e.message}",
+                )
+            }
             FAILURE
         }
     }

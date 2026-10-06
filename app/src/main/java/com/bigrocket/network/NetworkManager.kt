@@ -21,11 +21,13 @@ class NetworkManager(
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             super.onAvailable(network)
+            com.bigrocket.service.AppLogger.log("NetworkManager", "network available: $network - purging pooled connections")
             purgeConnections()
         }
 
         override fun onLost(network: Network) {
             super.onLost(network)
+            com.bigrocket.service.AppLogger.log("NetworkManager", "network lost: $network - purging pooled connections")
             purgeConnections()
         }
 

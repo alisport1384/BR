@@ -281,7 +281,10 @@ class BondingEngineImpl(
     }
 
     private fun transitionTo(next: BondingState) {
-        if (engineState.canTransitionTo(next)) engineState = next
+        if (engineState.canTransitionTo(next)) {
+            com.bigrocket.service.AppLogger.log("Bonding", "engine $engineState -> $next")
+            engineState = next
+        }
     }
 
     companion object {

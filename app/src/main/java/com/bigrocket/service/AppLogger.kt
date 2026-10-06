@@ -27,6 +27,10 @@ object AppLogger {
     @Volatile private var enabled: Boolean = false
     @Volatile private var logFile: File? = null
     @Volatile private var initialized: Boolean = false
+    /** "package/versionName (vc N)" - stamped into the export header and the enable line so a
+     *  field log can always be matched to the exact build that produced it (a real debugging
+     *  round was lost to not knowing which APK a log came from). */
+    @Volatile private var buildStamp: String = "unknown-build"
 
     /** Safe to call repeatedly (e.g. from both MainActivity and BigRocketVpnService's onCreate)
      *  - only does real work once. */
@@ -37,6 +41,25 @@ object AppLogger {
         val appContext = context.applicationContext
         enabled = LogSettingsStore.isEnabled(appContext)
         logFile = File(appContext.filesDir, LOG_FILE_NAME)
+        buildStamp = runCatching {
+            val pi = appContext.packageManager.getPackageInfo(appContext.packageName, 0)
+            @Suppress("DEPRECATION")
+            "${appContext.packageName}/${pi.versionName} (vc ${pi.versionCode})"
+        }.getOrDefault("unknown-build")
+        // Merge the Aether-side DiagnosticsLog into this logger's single timeline: engine
+        // process output ("engine"), xray core output ("xray"), hev tunnel ("hev"), SmartAuto
+        // ("auto"), chain decisions ("bigrocket") and every other tunnel-side tag land here
+        // interleaved with the service/path/bonding lines, in chronological order. Without
+        // this bridge those sections only existed in DiagnosticsLog's small export ring and
+        // could be evicted by one chatty component before the user exported the log.
+        studio.cluvex.aether.core.DiagnosticsLog.mirror = { tag, level, message ->
+            val prefix = when (level) {
+                studio.cluvex.aether.core.LogLevel.WARN -> "[warn] "
+                studio.cluvex.aether.core.LogLevel.ERROR -> "[error] "
+                else -> ""
+            }
+            log(tag, prefix + message)
+        }
     }
 
     fun isEnabled(): Boolean = enabled
@@ -47,7 +70,7 @@ object AppLogger {
         enabled = value
         // Always record the on/off transition itself - useful context for whoever reads the
         // exported log later, and confirms the toggle actually took effect.
-        log("Logging", if (value) "logging enabled" else "logging disabled")
+        log("Logging", if (value) "logging enabled ($buildStamp)" else "logging disabled")
     }
 
     fun log(tag: String, message: String) {
@@ -113,6 +136,7 @@ object AppLogger {
         val tunnelLog = runCatching { studio.cluvex.aether.core.DiagnosticsLog.exportText() }.getOrDefault("")
         return buildString {
             append("== BigRocket log ==\n")
+            append("build: $buildStamp\n")
             append(ownLog)
             if (tunnelLog.isNotBlank()) {
                 append("\n\n== Aether/tunnel diagnostics ==\n")

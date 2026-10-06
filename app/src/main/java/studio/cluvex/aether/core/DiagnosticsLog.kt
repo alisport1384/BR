@@ -116,6 +116,21 @@ object DiagnosticsLog {
     private var logFile: File? = null
 
     /**
+     * Optional mirror sink: when the host app (BigRocket) registers one, every
+     * line recorded here is ALSO forwarded to it, so the app-wide logger owns a
+     * single merged timeline (engine output, xray core output, hev tunnel,
+     * SmartAuto and chain decisions interleaved with the service/bonding/path
+     * logs, in one chronological stream). Root cause for its existence: the
+     * exported "Aether/tunnel diagnostics" section is a [MAX_LINES]-bounded ring,
+     * and one chatty component (791 xray access lines in a single connect
+     * attempt, in a real field log) evicted the one chain-decision line that was
+     * needed to diagnose a failure. The mirror makes eviction here harmless -
+     * the app logger keeps its own, much larger, persistent copy.
+     */
+    @Volatile
+    var mirror: ((tag: String, level: LogLevel, message: String) -> Unit)? = null
+
+    /**
      * Wires the persistent log file (call once from Application.onCreate). If a
      * file from a previous run exists (e.g. it ended in a crash), its contents
      * are preserved to `<name>.prev` and loaded back into the panel so the
@@ -160,6 +175,9 @@ object DiagnosticsLog {
         // Queue for the writer thread instead of touching the disk inline.
         pendingWrites.offer(line.format())
         ensureWriter()
+        // Forward to the host app's logger (never let a sink failure break
+        // engine logging - this path runs on scanning/engine threads).
+        mirror?.let { sink -> runCatching { sink(tag, level, message) } }
     }
 
     /** Publishes at most one immutable snapshot per [UI_PUBLISH_INTERVAL_MS]. */
@@ -254,6 +272,18 @@ object DiagnosticsLog {
         }
     }
 
-    fun exportText(): String =
-        synchronized(bufferLock) { buffer.toList() }.joinToString("\n") { it.format() }
+    /**
+     * Full text for export. Prefers the on-disk file (which holds far more
+     * than the [MAX_LINES] UI ring and survives a flood of chatty lines - the
+     * exact situation where the export is needed most), falling back to the
+     * in-memory buffer only when the file is missing/unreadable.
+     */
+    fun exportText(): String {
+        val file = logFile
+        if (file != null && file.exists()) {
+            val fromFile = runCatching { file.readText() }.getOrNull()
+            if (!fromFile.isNullOrBlank()) return fromFile.trimEnd()
+        }
+        return synchronized(bufferLock) { buffer.toList() }.joinToString("\n") { it.format() }
+    }
 }

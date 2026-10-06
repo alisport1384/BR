@@ -54,6 +54,7 @@ object EmbeddedXrayRuntime {
         val app = context.applicationContext
         job = scope.launch {
             runCatching {
+                AppLogger.log("Xray", "starting core (socks=$SOCKS_PORT chainPort=$chainPort)")
                 val raw = XrayConfigStore.read(app)
                     ?: error("هیچ پیکربندی Xray ثبت نشده است - ابتدا کانفیگ را در صفحه اصلی ذخیره کنید")
                 val configJson = XrayConfigBuilder.build(raw, SOCKS_PORT, chainPort)
@@ -109,8 +110,13 @@ object EmbeddedXrayRuntime {
      */
     fun needsRestart(context: Context, chainPort: Int): Boolean {
         if (!isRunning()) return false
-        if (chainPort != activeChainPort) return true
+        if (chainPort != activeChainPort) {
+            AppLogger.log("Xray", "needsRestart: chainPort $activeChainPort -> $chainPort")
+            return true
+        }
         val fingerprint = XrayConfigStore.read(context.applicationContext)?.hashCode() ?: 0
-        return fingerprint != activeConfigFingerprint
+        val changed = fingerprint != activeConfigFingerprint
+        if (changed) AppLogger.log("Xray", "needsRestart: saved config changed")
+        return changed
     }
 }

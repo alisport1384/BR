@@ -92,6 +92,14 @@ class SelectiveRecoveryManager(
 
     override fun request(sequence: Long) {
         requestedCount++
+        // Per-frame logging would flood on a lossy path; one aggregate line every 100
+        // requests keeps recovery pressure visible in the in-app log at near-zero cost.
+        if (requestedCount % 100L == 1L) {
+            com.bigrocket.service.AppLogger.log(
+                "Recovery",
+                "retransmit requests=$requestedCount fulfilled=$fulfilledCount",
+            )
+        }
         val frame = cache.get(sequence) ?: return
         fulfilledCount++
         val recoveredFrame = frame.copy(

@@ -21,6 +21,9 @@ object SmartTrafficEngine {
 
     private val pathStats = ConcurrentHashMap<Network, ConnectionPathStats>()
     private val packetCounter = AtomicInteger(0)
+    /** Last weights written to the in-app log; only meaningful changes are logged
+     *  (this runs on the traffic path - it must never flood). */
+    @Volatile private var lastLoggedWifiWeight = -1
 
     fun recordRealTrafficMetrics(network: Network, sampleRttMs: Long, isDropped: Boolean) {
         val stats = pathStats.getOrPut(network) { ConnectionPathStats(network) }
@@ -52,6 +55,15 @@ object SmartTrafficEngine {
         val wifiWeight = ((wifiScore / totalScore) * 100).toInt().coerceIn(10, 90)
         val cellWeight = 100 - wifiWeight
 
+        if (kotlin.math.abs(wifiWeight - lastLoggedWifiWeight) >= 10) {
+            lastLoggedWifiWeight = wifiWeight
+            AppLogger.log(
+                "SmartTraffic",
+                "adaptive weights wifi=$wifiWeight cell=$cellWeight " +
+                    "(wifi rtt=${wifiStats.rttMs}ms jitter=${wifiStats.smoothedJitter} loss=${"%.2f".format(wifiStats.getLossRatio())} | " +
+                    "cell rtt=${cellStats.rttMs}ms jitter=${cellStats.smoothedJitter} loss=${"%.2f".format(cellStats.getLossRatio())})",
+            )
+        }
         return Pair(wifiWeight, cellWeight)
     }
 

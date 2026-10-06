@@ -156,12 +156,14 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     private val wifiHealth = PathHealthTracker(
         failuresToDisconnect = PROBE_FAILURES_TO_DECLARE_LOST,
         successesToRecover = PROBE_SUCCESSES_TO_DECLARE_RECOVERED,
-        activityGraceMs = RECENT_TRAFFIC_GRACE_MS
+        activityGraceMs = RECENT_TRAFFIC_GRACE_MS,
+        label = "wifi"
     )
     private val cellularHealth = PathHealthTracker(
         failuresToDisconnect = PROBE_FAILURES_TO_DECLARE_LOST,
         successesToRecover = PROBE_SUCCESSES_TO_DECLARE_RECOVERED,
-        activityGraceMs = RECENT_TRAFFIC_GRACE_MS
+        activityGraceMs = RECENT_TRAFFIC_GRACE_MS,
+        label = "cellular"
     )
     // Which packet engine currently owns the TUN fd: the existing JVM router
     // (TunPacketRouter, handles both direct/NONE bonding and JVM-relayed AETHER

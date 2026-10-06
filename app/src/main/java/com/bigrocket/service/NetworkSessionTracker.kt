@@ -48,10 +48,15 @@ class NetworkSessionTracker {
     }
 
     fun migrateSessionsFromLostNetwork(deadNetwork: Network, fallbackNetwork: Network) {
+        var migrated = 0
         activeSessions.values.forEach { session ->
             if (session.assignedNetwork == deadNetwork) {
                 session.assignedNetwork = fallbackNetwork
+                migrated++
             }
+        }
+        if (migrated > 0) {
+            AppLogger.log("Sessions", "migrated $migrated pinned session(s) off dead network $deadNetwork -> $fallbackNetwork")
         }
     }
 

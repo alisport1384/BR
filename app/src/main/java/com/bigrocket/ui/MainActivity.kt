@@ -193,6 +193,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             XrayConfigStore.save(this, raw)
+            AppLogger.log("UI", "xray config saved (${raw.length} chars)")
             Toast.makeText(this, "کانفیگ Xray ذخیره شد", Toast.LENGTH_SHORT).show()
             // If an Xray chain is live, the Service re-checks and restarts the core
             // against the new config (see EmbeddedXrayRuntime.needsRestart).
@@ -282,6 +283,11 @@ class MainActivity : AppCompatActivity() {
                     AetherEmbeddedPanel(
                         profile = aetherProfile,
                         onProfileChange = { profile ->
+                            AppLogger.log(
+                                "UI",
+                                "aether profile changed: protocol=${profile.protocol} h2=${profile.masqueHttp2} " +
+                                    "scan=${profile.scanMode} endpoint=${profile.endpointMode} noize=${profile.noize}",
+                            )
                             aetherProfile = profile
                             lifecycleScope.launch { aetherProfileStore.save(profile) }
                         },
