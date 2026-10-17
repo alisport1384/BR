@@ -347,6 +347,11 @@ mod with_tor {
         prepare_dir(&home)?;
         prepare_dir(&cache)?;
         prepare_dir(&data)?;
+        // >>> AETHER-APP-PATCH tor-cache-seed
+        if slot.is_some() {
+            seed::into_slot(state, &cache);
+        }
+        // <<< AETHER-APP-PATCH tor-cache-seed
 
         let mut builder = TorClientConfigBuilder::default();
         builder
@@ -356,11 +361,18 @@ mod with_tor {
             .storage()
             .state_dir(CfgPath::new(data.to_string_lossy().to_string()));
 
-        if let Some(proxy) = through {
+        // Without a tunnel to dial through, tor leaves through the upstream proxy, if there is one.
+        if let Some(proxy) = through.or_else(upstream_socks) {
             let parsed: ProxyProtocol = format!("socks5://{proxy}")
                 .parse()
                 .map_err(|e| AetherError::Other(format!("tor cannot dial through {proxy}: {e}")))?;
             builder.channel().outbound_proxy(parsed);
+        } else if let Some(proxy) = crate::upstream::configured() {
+            // Connecting directly would leave outside the proxy aether was told to dial through.
+            return Err(AetherError::Other(format!(
+                "tor cannot dial through the upstream proxy at {}: it takes a socks5 address without a password",
+                proxy.endpoint()
+            )));
         }
 
         if let Some(plan) = plan {
@@ -593,6 +605,11 @@ mod with_tor {
     }
 
     async fn establish(state: &Path, through: Option<SocketAddr>, rounds: usize) -> Result<Client> {
+        // >>> AETHER-APP-PATCH tor-cache-seed
+        // No tor client of this process exists yet, so every cache on disk is at
+        // rest and can be copied consistently.
+        seed::snapshot(state);
+        // <<< AETHER-APP-PATCH tor-cache-seed
         let policy = bridges();
 
         if let Bridges::Manual(lines) = &policy {
@@ -807,6 +824,30 @@ mod with_tor {
         outcome
     }
 
+    /// The upstream proxy tor dials through when no tunnel carries it, see
+    /// [crate::upstream::Upstream::socks_address].
+    fn upstream_socks() -> Option<SocketAddr> {
+        crate::upstream::configured()?.socks_address()
+    }
+
+    /// Says how tor reaches the network when no tunnel carries it: through the upstream proxy, or
+    /// directly when there is none; with one tor cannot dial through, tor does not start.
+    fn announce_upstream() {
+        let Some(proxy) = crate::upstream::configured() else {
+            return;
+        };
+        match proxy.socks_address() {
+            Some(address) => {
+                log::info!("[*] tor dials out through the upstream proxy at {address}")
+            }
+            None => log::warn!(
+                "[-] tor cannot dial through the upstream proxy at {}, which is no socks5 address \
+                 without a password; it does not connect directly instead",
+                proxy.endpoint()
+            ),
+        }
+    }
+
     async fn wait_for_proxy(through: SocketAddr) {
         let mut announced = false;
         loop {
@@ -841,6 +882,7 @@ mod with_tor {
         let listener = crate::socks::bind_listener("tor socks5", listen).await?;
 
         log::info!("[*] bootstrapping tor with no tunnel underneath it");
+        announce_upstream();
 
         let client = establish(&state, None, FOREVER).await?;
         log::info!("[+] tor is ready; {listen} leaves through tor");
@@ -855,6 +897,8 @@ mod with_tor {
         let listener = crate::socks::bind_listener("tor socks5", listen).await?;
 
         log::info!("[*] bootstrapping tor; the tunnel will be dialled through it");
+        // The upstream is still the proxy aether was given: the caller points it at tor once tor is up.
+        announce_upstream();
 
         let client = establish(&state, None, REVERSE_ATTEMPTS).await?;
         log::info!("[+] tor is ready; the tunnel goes out through {listen}");
@@ -869,6 +913,175 @@ mod with_tor {
         Ok(listen)
     }
 
+    // >>> AETHER-APP-PATCH tor-cache-seed
+    /// Shares the directory cache between the bootstrap attempts.
+    ///
+    /// ROOT CAUSE (field logs `Config -> Tor`, 1.5.0): every attempt boots in a
+    /// cache of its own (`attempts/direct`, `attempts/obfs4`, ...). The direct
+    /// attempt loaded a complete, valid consensus from disk ("Loaded a good
+    /// directory from cache"), but the bridge attempt that followed it started
+    /// from an EMPTY cache ("Didn't get usable directory from cache") and had to
+    /// download the whole consensus and all 9 149 microdescriptors over an obfs4
+    /// bridge that was itself reached through the proxy chain - the one path on
+    /// which that download is slowest. The consensus is public and identical
+    /// for every attempt, so the freshest cache on disk is now copied into an
+    /// attempt that has nothing as good. Guard state (`state/`) stays separate.
+    mod seed {
+        use std::path::{Path, PathBuf};
+        use std::time::SystemTime;
+
+        /// Where the snapshot of the freshest cache is kept. Never opened by a tor client.
+        const SEED: &str = ".seed";
+        /// The sqlite files tor keeps. `-shm` is deliberately left out: sqlite
+        /// rebuilds it from the WAL, and a copied one could be stale.
+        const DB_FILES: [&str; 2] = ["dir.sqlite3", "dir.sqlite3-wal"];
+        /// Below this the cache holds no microdescriptors worth sharing.
+        const MIN_DB_BYTES: u64 = 1024 * 1024;
+
+        fn seed_dir(state: &Path) -> PathBuf {
+            state.join("attempts").join(SEED)
+        }
+
+        /// When the newest consensus in `cache` was stored, if `cache` also holds
+        /// enough microdescriptors to be worth copying.
+        fn usable_since(cache: &Path) -> Option<SystemTime> {
+            let db_bytes: u64 = DB_FILES
+                .iter()
+                .filter_map(|name| std::fs::metadata(cache.join(name)).ok())
+                .map(|meta| meta.len())
+                .sum();
+            if db_bytes < MIN_DB_BYTES {
+                return None;
+            }
+            std::fs::read_dir(cache.join("dir_blobs"))
+                .ok()?
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("con_microdesc"))
+                .filter_map(|entry| entry.metadata().and_then(|meta| meta.modified()).ok())
+                .max()
+        }
+
+        fn caches(state: &Path) -> Vec<PathBuf> {
+            let mut found = vec![state.join("cache")];
+            if let Ok(entries) = std::fs::read_dir(state.join("attempts")) {
+                for entry in entries.flatten() {
+                    // Skips the snapshot itself and any staging copy.
+                    if !entry.file_name().to_string_lossy().starts_with('.') {
+                        found.push(entry.path().join("cache"));
+                    }
+                }
+            }
+            found
+        }
+
+        fn private_dir(path: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(())
+        }
+
+        /// Copies the sqlite files and every blob `into` does not have yet.
+        fn copy_cache(from: &Path, into: &Path) -> std::io::Result<()> {
+            private_dir(into)?;
+            for name in DB_FILES.iter().chain(["dir.sqlite3-shm"].iter()) {
+                let _ = std::fs::remove_file(into.join(name));
+            }
+            for name in DB_FILES {
+                let source = from.join(name);
+                if source.is_file() {
+                    std::fs::copy(&source, into.join(name))?;
+                }
+            }
+            let blobs = from.join("dir_blobs");
+            if blobs.is_dir() {
+                let target = into.join("dir_blobs");
+                private_dir(&target)?;
+                for entry in std::fs::read_dir(&blobs)?.flatten() {
+                    let destination = target.join(entry.file_name());
+                    if entry.path().is_file() && !destination.exists() {
+                        std::fs::copy(entry.path(), &destination)?;
+                        // Keep the original store time: freshness is judged by it.
+                        if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&destination) {
+                                let _ = file.set_modified(modified);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// True while a tor client of this process may still have `cache` open.
+        fn in_use(cache: &Path) -> bool {
+            let lock = cache.join("dir.lock");
+            if !lock.exists() {
+                return false;
+            }
+            match std::fs::OpenOptions::new().read(true).write(true).open(&lock) {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) => {
+                        let _ = file.unlock();
+                        false
+                    }
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            }
+        }
+
+        /// Keeps a copy of the freshest cache. Called before any client exists.
+        pub(super) fn snapshot(state: &Path) {
+            let seed = seed_dir(state);
+            let best = caches(state)
+                .into_iter()
+                .filter(|cache| !in_use(cache))
+                .filter_map(|cache| usable_since(&cache).map(|when| (when, cache)))
+                .max_by_key(|(when, _)| *when);
+            let Some((when, source)) = best else {
+                return;
+            };
+            if usable_since(&seed).is_some_and(|held| held >= when) {
+                return;
+            }
+            let staging = state.join("attempts").join(".seed-new");
+            let _ = std::fs::remove_dir_all(&staging);
+            let outcome = copy_cache(&source, &staging).and_then(|()| {
+                let _ = std::fs::remove_dir_all(&seed);
+                std::fs::rename(&staging, &seed)
+            });
+            if let Err(e) = outcome {
+                let _ = std::fs::remove_dir_all(&staging);
+                log::warn!("[-] tor could not keep a copy of its directory cache: {e}");
+            }
+        }
+
+        /// Gives an attempt's cache the snapshot when it has nothing as fresh.
+        pub(super) fn into_slot(state: &Path, cache: &Path) {
+            let seed = seed_dir(state);
+            let Some(seeded) = usable_since(&seed) else {
+                return;
+            };
+            if usable_since(cache).is_some_and(|held| held >= seeded) || in_use(cache) {
+                return;
+            }
+            match copy_cache(&seed, cache) {
+                Ok(()) => log::info!("[*] tor starts this attempt from the directory it already has"),
+                Err(e) => {
+                    for name in DB_FILES {
+                        let _ = std::fs::remove_file(cache.join(name));
+                    }
+                    log::warn!("[-] tor could not share its directory cache with this attempt: {e}");
+                }
+            }
+        }
+    }
+
+    // <<< AETHER-APP-PATCH tor-cache-seed
     fn prepare_dir(path: &Path) -> Result<()> {
         std::fs::create_dir_all(path)?;
 
@@ -888,6 +1101,30 @@ mod with_tor {
 mod tests {
     use super::*;
 
+    /// The hold on the tor settings of a test: the variables are the whole process's, and the
+    /// tests run side by side, so each test holds them first, or one clearing them would wipe a
+    /// value another had just set. They start out clear, and are cleared again as the hold is
+    /// let go, also by a test that failed half way.
+    struct SettingsHeld(std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for SettingsHeld {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    /// Waits for the hold on the tor settings, see `SettingsHeld`. A test that failed while it
+    /// held them poisoned the lock, but cleared them all the same, so the lock is taken anyway.
+    fn hold_settings() -> SettingsHeld {
+        static SETTINGS: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let held = SETTINGS
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        SettingsHeld(held)
+    }
+
     fn clear() {
         std::env::remove_var("AETHER_TOR");
         std::env::remove_var("AETHER_TOR_DIR");
@@ -898,7 +1135,7 @@ mod tests {
 
     #[test]
     fn every_mode_has_a_spelling() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(mode(), Mode::Off);
         for written in ["1", "on", "chain", "yes"] {
             std::env::set_var("AETHER_TOR", written);
@@ -916,12 +1153,11 @@ mod tests {
             std::env::set_var("AETHER_TOR", written);
             assert_eq!(mode(), Mode::Off, "{written}");
         }
-        clear();
     }
 
     #[test]
     fn the_state_dir_sits_beside_the_identity_file() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(state_dir("aether.toml"), PathBuf::from("aether-tor"));
         assert_eq!(
             state_dir("/etc/aether/aether.toml"),
@@ -932,21 +1168,19 @@ mod tests {
             state_dir("aether.toml"),
             PathBuf::from("/var/lib/aether-tor")
         );
-        clear();
     }
 
     #[test]
     fn the_tor_listener_has_a_default_of_its_own() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(listen_address(), "127.0.0.1:1820".parse().unwrap());
         std::env::set_var("AETHER_TOR_BIND", "127.0.0.1:9150");
         assert_eq!(listen_address(), "127.0.0.1:9150".parse().unwrap());
-        clear();
     }
 
     #[test]
     fn bridges_are_read_one_per_entry() {
-        clear();
+        let _settings = hold_settings();
         assert!(bridge_lines().is_empty());
         std::env::set_var(
             "AETHER_TOR_BRIDGES",
@@ -956,12 +1190,11 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("obfs4 192.0.2.55"));
         assert!(lines[1].starts_with("obfs4 198.51.100.25"));
-        clear();
     }
 
     #[test]
     fn a_transport_may_be_named_or_assumed_to_be_obfs4() {
-        clear();
+        let _settings = hold_settings();
         assert!(transports().is_empty());
         std::env::set_var("AETHER_TOR_PT", "/usr/bin/lyrebird");
         assert_eq!(
@@ -982,7 +1215,6 @@ mod tests {
                 ),
             ]
         );
-        clear();
     }
 }
 

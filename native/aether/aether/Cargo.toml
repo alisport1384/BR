@@ -1,6 +1,6 @@
 [package]
 name = "aether"
-version = "2.1.0"
+version = "2.3.0"
 edition = "2021"
 # 1.3.0 CORE 2.0.0 REBASE: upstream raised the floor to 1.98 (arti-client and
 # the 2.0.0 dependency set need it). Taken as-is; the app's CI toolchain is
@@ -27,11 +27,11 @@ path = "src/main.rs"
 
 [dependencies]
 quiche = { path = "../quiche/quiche", default-features = false, features = ["boringssl-boring-crate", "qlog"] }
-boring = "4.22"
+boring = "5.2"
 foreign-types-shared = "0.3"
 libc = "0.2"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "signal", "process"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "socks", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
@@ -115,7 +115,7 @@ socket2 = { version = "0.6.4", features = ["all"] }
 h2 = "0.4.15"
 http = "1"
 bytes = "1"
-tokio-boring = "4.22"
+tokio-boring = "5.2"
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls", "compression", "static-sqlite", "bridge-client", "pt-client"], optional = true }
 tor-chanmgr = { version = "0.46", optional = true }
 tor-rtcompat = { version = "0.46", default-features = false, features = ["tokio", "rustls"], optional = true }
@@ -133,3 +133,16 @@ lto = "fat"
 codegen-units = 1
 panic = "unwind"
 strip = true
+# >>> AETHER-APP-PATCH tor-slow-chain
+
+# Two arti crates carry app patches for Tor dialled through a proxy chain
+# (`Config -> Tor`), kept in native/aether/vendor/ so a core sync never
+# replaces them. Each patched spot is marked AETHER-VENDOR-PATCH.
+#  * tor-chanmgr: no SNI in the relay TLS handshake when AETHER_TOR_LINK_SNI=off
+#    (a sniffing V2Ray/Xray server rewrites the relay address to the fake SNI).
+#  * tor-dirclient: directory bodies get an inactivity timeout instead of a
+#    fixed 10 s for the whole body, which a slow chain can never meet.
+[patch.crates-io]
+tor-chanmgr = { path = "../vendor/tor-chanmgr" }
+tor-dirclient = { path = "../vendor/tor-dirclient" }
+# <<< AETHER-APP-PATCH tor-slow-chain
