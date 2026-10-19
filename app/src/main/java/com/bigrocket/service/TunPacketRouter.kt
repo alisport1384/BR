@@ -129,6 +129,7 @@ class TunPacketRouter(
             val inputStream = FileInputStream(vpnInterface.fileDescriptor)
             val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
             tunOutputStream = outputStream
+            tcpRelayEngine.setTunOutputStream(outputStream)
             val buffer = ByteBuffer.allocate(32767)
 
             while (isRunning) {
@@ -195,5 +196,6 @@ class TunPacketRouter(
         tcpRelayEngine.clear()
         routerJob?.cancel()
         tunOutputStream = null
+        tcpRelayEngine.setTunOutputStream(null)
     }
 }
