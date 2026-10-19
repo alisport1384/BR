@@ -112,6 +112,19 @@ class TcpRelayEngine(
     private val writerJobs = ConcurrentHashMap<SessionKey, Job>()
     private var reaperJob: Job? = null
     @Volatile private var upstreamMode = UpstreamMode.NONE
+    // Set by TunPacketRouter alongside its own tunOutputStream field - see setTunOutputStream().
+    // Needed here so the reaper below can send an RST, same as every other closeSession() path
+    // already does (evictLruSessionIfAtCapacity, handleNetworkLost) - this one was the only
+    // path that didn't, which is exactly what let a stalled session (e.g. the upstream socket
+    // stuck in a read() that will never return - see AetherUpstream.openTcp()'s soTimeout=0)
+    // go completely silent to the client: we'd clean up our own side after
+    // TCP_IDLE_TIMEOUT_MS, but the client app was never told, so it just kept waiting on its
+    // own (often much longer) retransmission timer instead of retrying right away.
+    @Volatile private var reaperTunOutputStream: FileOutputStream? = null
+
+    fun setTunOutputStream(stream: FileOutputStream?) {
+        reaperTunOutputStream = stream
+    }
 
     init {
         reaperJob = scope.launch {
@@ -120,6 +133,7 @@ class TcpRelayEngine(
                 val now = System.currentTimeMillis()
                 sessions.entries.toList().forEach { (key, session) ->
                     if (session.socket.isClosed || now - session.lastActivityMs >= TCP_IDLE_TIMEOUT_MS) {
+                        reaperTunOutputStream?.let { sendRst(key, session, it) }
                         closeSession(key)
                     }
                 }
@@ -469,12 +483,15 @@ class TcpRelayEngine(
      * retry) before opening a new one. A linear scan over at most MAX_CONCURRENT_TCP_SESSIONS
      * entries is negligible - this only runs when opening a brand new session, not per packet.
      */
-    private fun evictLruSessionIfAtCapacity(tunOutputStream: FileOutputStream) {
-        if (sessions.size < MAX_CONCURRENT_TCP_SESSIONS) return
-
-        val oldest = sessions.entries.minByOrNull { it.value.lastActivityMs } ?: return
-        val key = oldest.key
-        val session = oldest.value
+    /**
+     * Tells the client app's own TCP stack a flow is dead, instead of leaving it to silently
+     * wait out its own retransmission/keepalive timer (which can run for minutes) - see
+     * handleNetworkLost's doc comment, which this now shares its implementation with. Used
+     * for every path that tears a session down for a reason the CLIENT could not otherwise
+     * detect itself: capacity eviction, a lost physical network, and (see the reaper in init{})
+     * a session the idle timeout gave up on.
+     */
+    private fun sendRst(key: SessionKey, session: TcpSession, tunOutputStream: FileOutputStream) {
         try {
             val rst = IpPacketBuilder.buildTcpResponsePacket(
                 srcIp = key.destinationIp,
@@ -493,6 +510,15 @@ class TcpRelayEngine(
             }
         } catch (_: Exception) {
         }
+    }
+
+    private fun evictLruSessionIfAtCapacity(tunOutputStream: FileOutputStream) {
+        if (sessions.size < MAX_CONCURRENT_TCP_SESSIONS) return
+
+        val oldest = sessions.entries.minByOrNull { it.value.lastActivityMs } ?: return
+        val key = oldest.key
+        val session = oldest.value
+        sendRst(key, session, tunOutputStream)
         closeSession(key)
     }
 
@@ -509,24 +535,7 @@ class TcpRelayEngine(
     fun handleNetworkLost(deadNetwork: Network, tunOutputStream: FileOutputStream) {
         sessions.entries.toList().forEach { (key, session) ->
             if (session.network != deadNetwork) return@forEach
-            try {
-                val rst = IpPacketBuilder.buildTcpResponsePacket(
-                    srcIp = key.destinationIp,
-                    srcPort = key.destinationPort,
-                    dstIp = key.sourceIp,
-                    dstPort = key.sourcePort,
-                    seqNumber = session.serverSeq,
-                    ackNumber = session.clientNextSeq,
-                    flags = TcpFlag.RST or TcpFlag.ACK,
-                    data = ByteArray(0),
-                    dataLength = 0
-                )
-                synchronized(tunOutputStream) {
-                    tunOutputStream.write(rst)
-                    tunOutputStream.flush()
-                }
-            } catch (_: Exception) {
-            }
+            sendRst(key, session, tunOutputStream)
             closeSession(key)
         }
     }
