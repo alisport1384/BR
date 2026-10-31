@@ -1,17 +1,19 @@
 package com.bigrocket.service
 
+import com.bigrocket.config.ConfigInputParser
+import com.bigrocket.config.ConfigParseException
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLDecoder
 
 /**
  * Builds the runtime Xray config for BigRocket's two Xray chains from the
- * user-supplied configuration (XrayConfigStore), which may be either:
+ * user-supplied configuration (XrayConfigStore). Input parsing lives in
+ * com.bigrocket.config (ConfigInputParser): share links (vless, vmess, trojan, ss,
+ * socks, wireguard), several links in one text, base64 subscription bodies, and full
+ * client JSON (v2rayNG / v2rayN style, or a bare outbound). When the input holds more
+ * than one config, the first one is used.
  *
- *  1. a share link (vless://...) — the format most clients export, or
- *  2. a full client JSON config (v2rayNG / v2rayN style).
- *
- * Both inputs are treated as TEMPLATES for the proxy server itself. The final
+ * The parsed outbound is treated as a TEMPLATE for the proxy server itself. The final
  * runtime config is always rebuilt deterministically around BigRocket's own
  * topology, because Xray here is never the device VPN — it is one hop inside
  * an already-established chain:
@@ -36,34 +38,27 @@ object XrayConfigBuilder {
     /** Outbound tag Xray's transport dials are chained through. */
     private const val CHAIN_TAG = "bonding-chain"
 
-    /** Protocols that can never be "the" proxy outbound of a client config. */
-    private val NON_PROXY_PROTOCOLS = setOf("freedom", "blackhole", "dns", "loopback")
-
     /**
-     * @param rawConfig    user input: share link or full client JSON
+     * @param rawConfig    user input: share link(s), subscription body or client JSON
+     *                     (see ConfigInputParser)
      * @param inboundPort  local SOCKS5 port Xray must listen on (loopback only)
      * @param chainPort    local SOCKS5 port Xray must dial out through
      *                     (BondingSocksServer.PORT or Aether's SOCKS port)
      * @return the complete runtime config JSON text
      */
     fun build(rawConfig: String, inboundPort: Int, chainPort: Int): String {
-        val trimmed = rawConfig.trim()
-        val proxyOutbound = when {
-            trimmed.startsWith("vless://", ignoreCase = true) -> {
-                AppLogger.log("XrayConfig", "model 1 (vless:// share link) detected")
-                parseVlessLink(trimmed)
-            }
-            trimmed.startsWith("{") -> {
-                AppLogger.log("XrayConfig", "model 2 (full client JSON) detected")
-                extractProxyOutbound(JSONObject(trimmed))
-            }
-            else -> {
-                AppLogger.log("XrayConfig", "config rejected: neither vless:// link nor JSON object")
-                throw IllegalArgumentException(
-                    "پیکربندی Xray نامعتبر است: فقط لینک vless:// یا کانفیگ کامل JSON پشتیبانی می‌شود"
-                )
-            }
+        val configs = try {
+            ConfigInputParser.parse(rawConfig)
+        } catch (e: ConfigParseException) {
+            AppLogger.log("XrayConfig", "config rejected: ${e.message}")
+            throw e
         }
+        val selected = configs.first()
+        AppLogger.log(
+            "XrayConfig",
+            "parsed ${configs.size} config(s); using #1 (${selected.protocol})",
+        )
+        val proxyOutbound = JSONObject(selected.outbound.toString()) // deep copy
 
         proxyOutbound.put("tag", "proxy")
 
@@ -128,187 +123,4 @@ object XrayConfigBuilder {
         )
         return config.toString(2)
     }
-
-    // ------------------------------------------------------------------
-    // Model 2: full client JSON — extract the proxy outbound
-    // ------------------------------------------------------------------
-
-    private fun extractProxyOutbound(root: JSONObject): JSONObject {
-        val outbounds = root.optJSONArray("outbounds")
-            ?: run {
-                AppLogger.log("XrayConfig", "config rejected: JSON has no outbounds section")
-                throw IllegalArgumentException("کانفیگ JSON فاقد بخش outbounds است")
-            }
-        var fallback: JSONObject? = null
-        for (i in 0 until outbounds.length()) {
-            val outbound = outbounds.optJSONObject(i) ?: continue
-            val protocol = outbound.optString("protocol").lowercase()
-            if (protocol.isEmpty() || protocol in NON_PROXY_PROTOCOLS) continue
-            if (outbound.optString("tag") == "proxy") {
-                return JSONObject(outbound.toString()) // deep copy
-            }
-            if (fallback == null) fallback = outbound
-        }
-        return fallback?.let { JSONObject(it.toString()) }
-            ?: run {
-                AppLogger.log("XrayConfig", "config rejected: no usable proxy outbound in JSON")
-                throw IllegalArgumentException("هیچ outbound پروکسی معتبری در کانفیگ JSON یافت نشد")
-            }
-    }
-
-    // ------------------------------------------------------------------
-    // Model 1: vless:// share link
-    // ------------------------------------------------------------------
-
-    private fun parseVlessLink(link: String): JSONObject {
-        val body = link.substring("vless://".length).substringBefore('#')
-        val query = body.substringAfter('?', "")
-        val main = body.substringBefore('?')
-
-        val at = main.lastIndexOf('@')
-        require(at > 0) { "لینک vless نامعتبر است: UUID یافت نشد" }
-        val uuid = decode(main.substring(0, at))
-        val hostPort = main.substring(at + 1)
-
-        val (address, port) = splitHostPort(hostPort)
-        val params = parseQuery(query)
-
-        val user = JSONObject()
-            .put("id", uuid)
-            .put("encryption", params["encryption"] ?: "none")
-        params["flow"]?.takeIf { it.isNotEmpty() }?.let { user.put("flow", it) }
-
-        val outbound = JSONObject()
-            .put("protocol", "vless")
-            .put(
-                "settings",
-                JSONObject().put(
-                    "vnext",
-                    JSONArray().put(
-                        JSONObject()
-                            .put("address", address)
-                            .put("port", port)
-                            .put("users", JSONArray().put(user))
-                    )
-                )
-            )
-            .put("streamSettings", buildStreamSettings(params, address))
-        return outbound
-    }
-
-    private fun buildStreamSettings(params: Map<String, String>, address: String): JSONObject {
-        val network = (params["type"] ?: "tcp").ifEmpty { "tcp" }
-        val stream = JSONObject().put("network", network)
-
-        when (network) {
-            "ws" -> {
-                val ws = JSONObject()
-                params["path"]?.takeIf { it.isNotEmpty() }?.let { ws.put("path", it) }
-                params["host"]?.takeIf { it.isNotEmpty() }?.let { ws.put("host", it) }
-                stream.put("wsSettings", ws)
-            }
-            "httpupgrade" -> {
-                val hu = JSONObject()
-                params["path"]?.takeIf { it.isNotEmpty() }?.let { hu.put("path", it) }
-                params["host"]?.takeIf { it.isNotEmpty() }?.let { hu.put("host", it) }
-                stream.put("httpupgradeSettings", hu)
-            }
-            "xhttp", "splithttp" -> {
-                val xh = JSONObject()
-                params["path"]?.takeIf { it.isNotEmpty() }?.let { xh.put("path", it) }
-                params["host"]?.takeIf { it.isNotEmpty() }?.let { xh.put("host", it) }
-                params["mode"]?.takeIf { it.isNotEmpty() }?.let { xh.put("mode", it) }
-                stream.put("xhttpSettings", xh)
-            }
-            "grpc" -> {
-                val grpc = JSONObject()
-                params["serviceName"]?.takeIf { it.isNotEmpty() }?.let { grpc.put("serviceName", it) }
-                if (params["mode"] == "multi") grpc.put("multiMode", true)
-                stream.put("grpcSettings", grpc)
-            }
-            "h2", "http" -> {
-                stream.put("network", "http")
-                val http = JSONObject()
-                params["path"]?.takeIf { it.isNotEmpty() }?.let { http.put("path", it) }
-                params["host"]?.takeIf { it.isNotEmpty() }
-                    ?.let { http.put("host", JSONArray(it.split(',').map(String::trim))) }
-                stream.put("httpSettings", http)
-            }
-            "kcp" -> {
-                val kcp = JSONObject()
-                params["headerType"]?.takeIf { it.isNotEmpty() }
-                    ?.let { kcp.put("header", JSONObject().put("type", it)) }
-                params["seed"]?.takeIf { it.isNotEmpty() }?.let { kcp.put("seed", it) }
-                stream.put("kcpSettings", kcp)
-            }
-            "tcp" -> {
-                if (params["headerType"] == "http") {
-                    val hostList = JSONArray(
-                        (params["host"] ?: address).split(',').map(String::trim)
-                    )
-                    val request = JSONObject()
-                        .put("path", JSONArray().put(params["path"]?.ifEmpty { "/" } ?: "/"))
-                        .put("headers", JSONObject().put("Host", hostList))
-                    stream.put(
-                        "tcpSettings",
-                        JSONObject().put(
-                            "header",
-                            JSONObject().put("type", "http").put("request", request)
-                        )
-                    )
-                }
-            }
-        }
-
-        when (params["security"] ?: "none") {
-            "tls" -> {
-                val tls = JSONObject()
-                    .put("serverName", params["sni"] ?: params["host"] ?: address)
-                params["fp"]?.takeIf { it.isNotEmpty() }?.let { tls.put("fingerprint", it) }
-                params["alpn"]?.takeIf { it.isNotEmpty() }
-                    ?.let { tls.put("alpn", JSONArray(it.split(',').map(String::trim))) }
-                if (params["allowInsecure"] in setOf("1", "true") || params["insecure"] == "1") {
-                    tls.put("allowInsecure", true)
-                }
-                stream.put("security", "tls").put("tlsSettings", tls)
-            }
-            "reality" -> {
-                val reality = JSONObject()
-                    .put("serverName", params["sni"] ?: address)
-                    .put("publicKey", params["pbk"] ?: "")
-                params["fp"]?.takeIf { it.isNotEmpty() }?.let { reality.put("fingerprint", it) }
-                params["sid"]?.let { reality.put("shortId", it) }
-                params["spx"]?.takeIf { it.isNotEmpty() }?.let { reality.put("spiderX", it) }
-                stream.put("security", "reality").put("realitySettings", reality)
-            }
-        }
-        return stream
-    }
-
-    private fun splitHostPort(hostPort: String): Pair<String, Int> {
-        if (hostPort.startsWith("[")) { // IPv6 literal
-            val end = hostPort.indexOf(']')
-            require(end > 0 && end + 1 < hostPort.length && hostPort[end + 1] == ':') {
-                "لینک vless نامعتبر است: آدرس/پورت قابل تشخیص نیست"
-            }
-            return hostPort.substring(1, end) to hostPort.substring(end + 2).toInt()
-        }
-        val sep = hostPort.lastIndexOf(':')
-        require(sep > 0) { "لینک vless نامعتبر است: پورت یافت نشد" }
-        return hostPort.substring(0, sep) to hostPort.substring(sep + 1).toInt()
-    }
-
-    private fun parseQuery(query: String): Map<String, String> {
-        if (query.isEmpty()) return emptyMap()
-        return query.split('&')
-            .filter { it.isNotEmpty() }
-            .associate { pair ->
-                val eq = pair.indexOf('=')
-                if (eq < 0) decode(pair) to ""
-                else decode(pair.substring(0, eq)) to decode(pair.substring(eq + 1))
-            }
-    }
-
-    private fun decode(value: String): String =
-        URLDecoder.decode(value, "UTF-8")
 }

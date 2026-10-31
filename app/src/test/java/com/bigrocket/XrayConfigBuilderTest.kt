@@ -148,4 +148,54 @@ class XrayConfigBuilderTest {
         } catch (_: IllegalArgumentException) {
         }
     }
+
+    @Test
+    fun `trojan link is chained through the local boundary`() {
+        val config = JSONObject(
+            XrayConfigBuilder.build("trojan://pw@t.example.com:443?sni=t.example.com#T", 1839, 12347)
+        )
+        val proxy = config.getJSONArray("outbounds").getJSONObject(0)
+        assertEquals("trojan", proxy.getString("protocol"))
+        assertEquals(
+            "bonding-chain",
+            proxy.getJSONObject("streamSettings").getJSONObject("sockopt").getString("dialerProxy"),
+        )
+    }
+
+    @Test
+    fun `wireguard outbound gets only the chain dialer`() {
+        val link = "wireguard://PRIVKEY@5.6.7.8:51820?publickey=PUB#wg"
+        val proxy = JSONObject(XrayConfigBuilder.build(link, 1839, 12347))
+            .getJSONArray("outbounds").getJSONObject(0)
+        assertEquals("wireguard", proxy.getString("protocol"))
+        val stream = proxy.getJSONObject("streamSettings")
+        assertEquals(1, stream.length())
+        assertEquals("bonding-chain", stream.getJSONObject("sockopt").getString("dialerProxy"))
+    }
+
+    @Test
+    fun `several configs use the first and never leak user routing`() {
+        val text = "trojan://pw@first.example.com:443#1\nvless://d9924deb-67fa-45c1-b867-d0110af15f4a@second.example.com:443?security=tls#2"
+        val config = JSONObject(XrayConfigBuilder.build(text, 1839, 12347))
+        val server = config.getJSONArray("outbounds").getJSONObject(0)
+            .getJSONObject("settings").getJSONArray("servers").getJSONObject(0)
+        assertEquals("first.example.com", server.getString("address"))
+        assertEquals(2, config.getJSONArray("outbounds").length())
+    }
+
+    @Test
+    fun `user proxySettings and mux cannot escape the chain`() {
+        val json = """
+            {"outbounds":[{"protocol":"vless","tag":"proxy","mux":{"enabled":true},
+              "proxySettings":{"tag":"elsewhere"},"sendThrough":"192.168.1.5",
+              "settings":{"vnext":[{"address":"a.example.com","port":443,"users":[{"id":"x"}]}]},
+              "streamSettings":{"network":"tcp"}}]}
+        """.trimIndent()
+        val proxy = JSONObject(XrayConfigBuilder.build(json, 1839, 12347))
+            .getJSONArray("outbounds").getJSONObject(0)
+        assertFalse(proxy.has("mux"))
+        assertFalse(proxy.has("proxySettings"))
+        assertFalse(proxy.has("sendThrough"))
+        assertEquals("proxy", proxy.getString("tag"))
+    }
 }

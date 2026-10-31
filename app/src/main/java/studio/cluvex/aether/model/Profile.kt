@@ -224,7 +224,10 @@ data class ConnectionProfile(
             Protocol.AUTO -> { /* resolved by SmartAuto before launch */ }
             Protocol.MASQUE -> args += "--masque"
             Protocol.WIREGUARD -> args += "--wg"
-            Protocol.GOOL -> args += "--gool"
+            // Core 2.4.0 redefined `--gool` (MASQUE outer hop, WireGuard identity inside).
+            // BigRocket's GOOL is the original WireGuard-in-WireGuard, which is now
+            // `--gool-classic`; this keeps GOOL's behaviour identical across the upgrade.
+            Protocol.GOOL -> args += "--gool-classic"
             // MIM = MASQUE-in-MASQUE, new in engine core 2.0.0: two nested MASQUE
             // hops (the MASQUE counterpart to GOOL's two nested WireGuard hops).
             Protocol.MIM -> args += "--mim"

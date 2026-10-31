@@ -33,6 +33,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import studio.cluvex.aether.data.ProfileStore
 import studio.cluvex.aether.model.ConnectionProfile
+import com.bigrocket.config.ConfigInputParser
+import com.bigrocket.config.ConfigParseException
+import com.bigrocket.config.SubscriptionFetcher
 import com.bigrocket.service.EmbeddedAetherRuntime
 import com.bigrocket.service.XrayConfigBuilder
 import com.bigrocket.service.XrayConfigStore
@@ -43,8 +46,10 @@ import com.bigrocket.R
 import com.bigrocket.service.BigRocketVpnService
 import com.bigrocket.service.BondingMode
 import com.bigrocket.service.BondingStatus
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** The two modes the app can run in - exactly one embedded upstream is ever active.
  *  Owned by EmbeddedAetherRuntime now (the Service needs it independent of any Activity);
@@ -75,6 +80,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var xrayConfigSection: LinearLayout
     private lateinit var etXrayConfig: android.widget.EditText
     private lateinit var btnSaveXrayConfig: Button
+    private lateinit var btnImportXrayFile: Button
     private lateinit var toolbar: Toolbar
     private var upstreamChoice = UpstreamChoice.NONE
     // Backed by Compose state (not a plain var): AetherEmbeddedPanel reads this inside
@@ -103,6 +109,23 @@ class MainActivity : AppCompatActivity() {
         // Whether granted or not, we still proceed - the VPN/relay itself works either way,
         // only the persistent status notification would stay hidden if denied.
         proceedToVpnPermissionCheck()
+    }
+
+    private val importXrayFileLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult // user cancelled the picker
+        lifecycleScope.launch {
+            try {
+                val text = withContext(Dispatchers.IO) { readXrayConfigFile(uri) }
+                etXrayConfig.setText(text)
+                Toast.makeText(this@MainActivity, "فایل بارگذاری شد؛ برای اعتبارسنجی ذخیره را بزنید", Toast.LENGTH_SHORT).show()
+            } catch (e: ConfigParseException) {
+                Toast.makeText(this@MainActivity, e.message, Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "خواندن فایل ناموفق بود: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private val saveLogLauncher = registerForActivityResult(
@@ -173,40 +196,96 @@ class MainActivity : AppCompatActivity() {
         xrayConfigSection = findViewById(R.id.xrayConfigSection)
         etXrayConfig = findViewById(R.id.etXrayConfig)
         btnSaveXrayConfig = findViewById(R.id.btnSaveXrayConfig)
+        btnImportXrayFile = findViewById(R.id.btnImportXrayFile)
         setupXrayConfigControls()
     }
 
     private fun setupXrayConfigControls() {
         XrayConfigStore.read(this)?.let { etXrayConfig.setText(it) }
+        btnImportXrayFile.setOnClickListener {
+            importXrayFileLauncher.launch(arrayOf("*/*"))
+        }
         btnSaveXrayConfig.setOnClickListener {
             val raw = etXrayConfig.text?.toString()?.trim().orEmpty()
             if (raw.isEmpty()) {
                 Toast.makeText(this, "کانفیگ Xray خالی است", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            // Validate by actually building the runtime config (ports are irrelevant
-            // for validation) so a broken paste is rejected here, not at connect time.
-            try {
-                XrayConfigBuilder.build(raw, 1, 2)
-            } catch (e: Exception) {
-                Toast.makeText(this, e.message ?: "کانفیگ Xray نامعتبر است", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
+            if (ConfigInputParser.isSubscriptionUrl(raw)) {
+                // The Service reads the stored config synchronously, so a subscription URL
+                // is downloaded here and its body (the resolved links) is what gets saved.
+                btnSaveXrayConfig.isEnabled = false
+                lifecycleScope.launch {
+                    try {
+                        val body = withContext(Dispatchers.IO) { SubscriptionFetcher.fetch(raw) }
+                        etXrayConfig.setText(body.trim())
+                        saveXrayConfig(body.trim())
+                    } catch (e: ConfigParseException) {
+                        Toast.makeText(this@MainActivity, e.message, Toast.LENGTH_LONG).show()
+                    } finally {
+                        btnSaveXrayConfig.isEnabled = true
+                    }
+                }
+            } else {
+                saveXrayConfig(raw)
             }
+        }
+    }
+
+    /** Reads a config file the user picked; text only, size-capped, strict UTF-8. */
+    private fun readXrayConfigFile(uri: Uri): String {
+        val max = ConfigInputParser.MAX_INPUT_CHARS
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: throw ConfigParseException("فایل قابل خواندن نیست")
+        if (bytes.size > max) throw ConfigParseException("فایل بیش از حد بزرگ است")
+        if (bytes.size >= 4 && String(bytes, 0, 4, Charsets.US_ASCII) == "NPVS") {
+            throw ConfigParseException(ConfigInputParser.NAPSTERNET_UNSUPPORTED)
+        }
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        return try {
+            decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString().trim()
+        } catch (_: java.nio.charset.CharacterCodingException) {
+            throw ConfigParseException("فایل متنی نیست؛ فقط فایل‌های متنی یا JSON پشتیبانی می‌شوند")
+        }
+    }
+
+    private fun saveXrayConfig(raw: String) {
+        // Validate by actually building the runtime config (ports are irrelevant
+        // for validation) so a broken paste is rejected here, not at connect time.
+        val count = try {
+            XrayConfigBuilder.build(raw, 1, 2)
+            ConfigInputParser.parse(raw).size
+        } catch (e: Exception) {
+            Toast.makeText(this, e.message ?: "کانفیگ Xray نامعتبر است", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
             XrayConfigStore.save(this, raw)
-            AppLogger.log("UI", "xray config saved (${raw.length} chars)")
-            Toast.makeText(this, "کانفیگ Xray ذخیره شد", Toast.LENGTH_SHORT).show()
-            // If an Xray chain is live, the Service re-checks and restarts the core
-            // against the new config (see EmbeddedXrayRuntime.needsRestart).
-            if (BigRocketVpnService.runningInstance != null &&
-                (upstreamChoice == UpstreamChoice.XRAY ||
-                    upstreamChoice == UpstreamChoice.AETHER_XRAY ||
-                    upstreamChoice == UpstreamChoice.XRAY_AETHER)
-            ) {
-                startService(
-                    Intent(this, BigRocketVpnService::class.java)
-                        .setAction(BigRocketVpnService.ACTION_UPSTREAM_CHANGED)
-                )
-            }
+        } catch (e: Exception) {
+            AppLogger.log("UI", "xray config save failed: ${e.javaClass.simpleName}")
+            Toast.makeText(this, "ذخیره امن کانفیگ ناموفق بود", Toast.LENGTH_LONG).show()
+            return
+        }
+        AppLogger.log("UI", "xray config saved (${raw.length} chars, $count config(s))")
+        Toast.makeText(
+            this,
+            if (count > 1) "کانفیگ Xray ذخیره شد ($count کانفیگ یافت شد؛ اولین مورد استفاده می‌شود)"
+            else "کانفیگ Xray ذخیره شد",
+            Toast.LENGTH_SHORT,
+        ).show()
+        // If an Xray chain is live, the Service re-checks and restarts the core
+        // against the new config (see EmbeddedXrayRuntime.needsRestart).
+        if (BigRocketVpnService.runningInstance != null &&
+            (upstreamChoice == UpstreamChoice.XRAY ||
+                upstreamChoice == UpstreamChoice.AETHER_XRAY ||
+                upstreamChoice == UpstreamChoice.XRAY_AETHER)
+        ) {
+            startService(
+                Intent(this, BigRocketVpnService::class.java)
+                    .setAction(BigRocketVpnService.ACTION_UPSTREAM_CHANGED)
+            )
         }
     }
 
