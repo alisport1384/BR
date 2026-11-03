@@ -501,6 +501,46 @@ object NetProbe {
         return null
     }
 
+    /**
+     * End-to-end liveness check THROUGH a local SOCKS5 listener (the engine's or Xray's).
+     *
+     * True only when a real request travels the whole chain and an HTTP status line comes
+     * back: a successful TCP connect to the local port proves nothing, because the listener
+     * stays open after the tunnel behind it has stalled. Two independent targets are tried
+     * in turn (one by IP, one by DOMAIN so DNS is exercised too) so a single blocked
+     * address cannot make a healthy tunnel look dead.
+     *
+     * Blocking, bounded by roughly 2 x [timeoutMs]; call from a background dispatcher.
+     */
+    fun tunnelAlive(socksHost: String, socksPort: Int, timeoutMs: Int = 6000): Boolean {
+        val targets = listOf(
+            Triple("1.1.1.1", false, "/"),
+            Triple("connectivitycheck.gstatic.com", true, "/generate_204"),
+        )
+        for ((host, useDomain, path) in targets) {
+            val ok = try {
+                socks5Connect(socksHost, socksPort, host, 80, useDomain, timeoutMs).use { s ->
+                    s.soTimeout = timeoutMs
+                    s.getOutputStream().apply {
+                        write(
+                            ("GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
+                                .toByteArray(Charsets.US_ASCII),
+                        )
+                        flush()
+                    }
+                    val head = ByteArray(5)
+                    DataInputStream(s.getInputStream()).readFully(head)
+                    String(head, Charsets.US_ASCII) == "HTTP/"
+                }
+            } catch (e: Exception) {
+                DiagnosticsLog.d("netprobe", "tunnel liveness via $host failed: ${e.message}")
+                false
+            }
+            if (ok) return true
+        }
+        return false
+    }
+
     /** Turns a 2-letter ISO country code into its flag emoji. */
     fun flagEmoji(countryCode: String?): String {
         if (countryCode == null || countryCode.length != 2) return "\uD83C\uDFF3\uFE0F"

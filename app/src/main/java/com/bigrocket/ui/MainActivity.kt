@@ -37,6 +37,8 @@ import com.bigrocket.config.ConfigInputParser
 import com.bigrocket.config.ConfigParseException
 import com.bigrocket.config.SubscriptionFetcher
 import com.bigrocket.service.EmbeddedAetherRuntime
+import com.bigrocket.service.UpstreamHealth
+import com.bigrocket.service.UpstreamLevel
 import com.bigrocket.service.XrayConfigBuilder
 import com.bigrocket.service.XrayConfigStore
 import com.bigrocket.service.DynamicWeightCalculator
@@ -69,6 +71,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvMode: TextView
     private lateinit var tvSpeed: TextView
     private lateinit var tvVpnStatus: TextView
+    private lateinit var tvUpstreamStatus: TextView
     private lateinit var tvBarLegend: TextView
     private lateinit var barWifi: View
     private lateinit var barCellular: View
@@ -185,6 +188,7 @@ class MainActivity : AppCompatActivity() {
         tvMode = findViewById(R.id.tvMode)
         tvSpeed = findViewById(R.id.tvSpeed)
         tvVpnStatus = findViewById(R.id.tvVpnStatus)
+        tvUpstreamStatus = findViewById(R.id.tvUpstreamStatus)
         tvBarLegend = findViewById(R.id.tvBarLegend)
         barWifi = findViewById(R.id.barWifi)
         barCellular = findViewById(R.id.barCellular)
@@ -545,6 +549,26 @@ class MainActivity : AppCompatActivity() {
                     state.cellularWeight.coerceAtLeast(1).toFloat()
                 barWifi.requestLayout()
                 barCellular.requestLayout()
+            }
+        }
+
+        // The upstream chain (Aether / Xray) failing used to be invisible here: the user saw
+        // a normal "VPN active" screen while traffic silently bypassed the tunnel. Shown
+        // only when there is something to say (see UpstreamSupervisor.publishWorking).
+        lifecycleScope.launch {
+            UpstreamHealth.status.collectLatest { status ->
+                if (status.level == UpstreamLevel.OK || status.message.isEmpty()) {
+                    tvUpstreamStatus.visibility = android.view.View.GONE
+                } else {
+                    tvUpstreamStatus.text = status.message
+                    tvUpstreamStatus.setTextColor(
+                        getColor(
+                            if (status.level == UpstreamLevel.WORKING) R.color.br_text_muted
+                            else R.color.br_accent_error
+                        )
+                    )
+                    tvUpstreamStatus.visibility = android.view.View.VISIBLE
+                }
             }
         }
 

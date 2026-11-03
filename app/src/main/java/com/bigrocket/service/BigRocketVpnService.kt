@@ -40,6 +40,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import studio.cluvex.aether.core.DiagnosticsLog
 import studio.cluvex.aether.core.HevConfig
 import studio.cluvex.aether.core.HevTunnel
+import studio.cluvex.aether.core.NetProbe
 import studio.cluvex.aether.core.TunnelConfig
 
 /**
@@ -83,6 +84,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             private set
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "bigrocket_vpn_channel"
+        // Separate, high-importance channel: the persistent notification above is LOW (silent,
+        // collapsed), which is exactly why a broken tunnel used to go unnoticed.
+        private const val ALERT_CHANNEL_ID = "bigrocket_alert_channel"
+        private const val ALERT_NOTIFICATION_ID = 1002
         private const val WEIGHT_UPDATE_INTERVAL_MS = 1000L
         // Deliberately much slower than WEIGHT_UPDATE_INTERVAL_MS - each cycle opens
         // LatencyTester.testLossRate()'s probeCount (default 8) sockets per path; doing that
@@ -183,6 +188,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     // versa) can't race on the fields above.
     private val controlMutex = Mutex()
 
+    // Keeps the Aether/Xray chain alive and tells the user when it is not (see
+    // UpstreamSupervisor). Created once the VPN is up, stopped with it.
+    private var upstreamSupervisor: UpstreamSupervisor? = null
+
     // Set right before entering controlMutex.withLock / engineSwitchMutex.withLock,
     // cleared right after - this is what the watchdog Thread below polls.
     // @Volatile because it is written from serviceScope (Dispatchers.IO)
@@ -190,6 +199,77 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     @Volatile private var controlOpStartedAt: Long = 0L
     @Volatile private var controlOpLabel: String = ""
     @Volatile private var engineSwitchStartedAt: Long = 0L
+
+    /** Everything the supervisor needs from this service, and nothing else. */
+    private val upstreamHost = object : UpstreamSupervisor.Host {
+        override fun isVpnRunning() = isRunning
+
+        override fun choice() = EmbeddedAetherRuntime.readUpstreamChoice(applicationContext)
+
+        override fun stageStatus(stage: UpstreamPolicy.Stage): RuntimeStatus = when (stage) {
+            UpstreamPolicy.Stage.AETHER -> EmbeddedAetherRuntime.status()
+            UpstreamPolicy.Stage.XRAY -> EmbeddedXrayRuntime.status()
+        }
+
+        override fun hasUsablePath(): Boolean =
+            (wifiNetwork != null && wifiHealth.state != PathHealthState.DISCONNECTED) ||
+                (cellularNetwork != null && cellularHealth.state != PathHealthState.DISCONNECTED)
+
+        override suspend fun converge() {
+            runControlOp("supervisor-converge") { applyUpstreamChoice() }
+        }
+
+        override suspend fun restartChain(reason: String) {
+            runControlOp("supervisor-restart") {
+                AppLogger.log("VpnService", "supervisor restarting the upstream chain: $reason")
+                // Whole chain, not one stage: the stages dial through each other, so a
+                // restarted half would be left pointing at a dead listener.
+                EmbeddedXrayRuntime.stop()
+                EmbeddedAetherRuntime.stop(applicationContext, keepEnabled = true)
+                applyUpstreamChoice()
+            }
+        }
+
+        override suspend fun probeChain(): Boolean {
+            // The listener the TUN traffic actually enters through (see currentChainState).
+            val port = when (EmbeddedAetherRuntime.readUpstreamChoice(applicationContext)) {
+                EmbeddedAetherRuntime.UpstreamChoice.XRAY,
+                EmbeddedAetherRuntime.UpstreamChoice.AETHER_XRAY -> EmbeddedXrayRuntime.SOCKS_PORT
+                else -> TunnelConfig.SOCKS_PORT
+            }
+            return BoundedCall.run(15_000L) { NetProbe.tunnelAlive(TunnelConfig.SOCKS_HOST, port) } == true
+        }
+
+        override fun showAlert(title: String, text: String) = postAlert(title, text)
+
+        override fun clearAlert() {
+            getSystemService(NotificationManager::class.java)?.cancel(ALERT_NOTIFICATION_ID)
+        }
+
+        override fun log(message: String) = AppLogger.log("Supervisor", message)
+    }
+
+    private fun postAlert(title: String, text: String) {
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        val openApp = PendingIntent.getActivity(
+            this,
+            3,
+            packageManager.getLaunchIntentForPackage(packageName) ?: Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ERROR)
+            .setContentIntent(openApp)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        manager.notify(ALERT_NOTIFICATION_ID, notification)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -441,7 +521,11 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
 
         if (intent?.action == ACTION_UPSTREAM_CHANGED) {
             if (isRunning) {
-                serviceScope.launch { runControlOp("upstream-changed") { applyUpstreamChoice() } }
+                serviceScope.launch {
+                    runControlOp("upstream-changed") { applyUpstreamChoice() }
+                    // A different chain: the old one's failure history no longer applies.
+                    upstreamSupervisor?.onChoiceChanged()
+                }
             }
             return START_STICKY
         }
@@ -621,6 +705,12 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             // Engine lifecycle ownership lives here now, not in MainActivity - see
             // ACTION_UPSTREAM_CHANGED and applyUpstreamChoice() below for why.
             applyUpstreamChoice()
+
+            // From here on something keeps watching the chain: a failed, dead or stalled
+            // engine is restarted (with backoff) and the user is told, instead of the
+            // service sitting on "checking" or on silent direct traffic indefinitely.
+            upstreamSupervisor?.stop()
+            upstreamSupervisor = UpstreamSupervisor(upstreamHost, serviceScope).also { it.start() }
         } catch (e: Exception) {
             AppLogger.logError("VpnService", "setupVpn() failed, tearing down", e)
             stopVpn()
@@ -758,6 +848,7 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 (oldCellular == null && cellular != null) ||
                 (oldWifi != null && wifi != null && oldWifi != wifi) ||
                 (oldCellular != null && cellular != null && oldCellular != cellular)
+        if (oldWifi != wifi || oldCellular != cellular) upstreamSupervisor?.onPathsChanged()
         AppLogger.log(
             "Networks",
             "onNetworksUpdated oldWifi=${oldWifi?.hashCode()} wifi=${wifi?.hashCode()} oldCellular=${oldCellular?.hashCode()} cellular=${cellular?.hashCode()} bothAvailable=$bothAvailable pathRecovered=$pathRecovered",
@@ -1037,6 +1128,13 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             )
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
+            manager?.createNotificationChannel(
+                NotificationChannel(
+                    ALERT_CHANNEL_ID,
+                    "هشدار اتصال",
+                    NotificationManager.IMPORTANCE_HIGH,
+                ),
+            )
         }
     }
 
@@ -1060,7 +1158,12 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
             Intent(this, BigRocketVpnService::class.java).setAction(ACTION_RESET),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val (title, text) = notificationTextFor(state)
+        val health = UpstreamHealth.status.value
+        val (title, text) = if (health.level != UpstreamLevel.OK && health.message.isNotEmpty()) {
+            "BigRocket" to health.message
+        } else {
+            notificationTextFor(state)
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(text)
@@ -1087,16 +1190,21 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     /** Keeps the persistent notification's title/text in sync with AetherController.state. */
     private fun startNotificationStateSync() {
         serviceScope.launch {
-            AetherController.state.collectLatest { state ->
-                val manager = getSystemService(NotificationManager::class.java)
-                manager?.notify(NOTIFICATION_ID, createNotification(state))
-            }
+            combine(AetherController.state, UpstreamHealth.status) { state, _ -> state }
+                .collectLatest { state ->
+                    val manager = getSystemService(NotificationManager::class.java)
+                    manager?.notify(NOTIFICATION_ID, createNotification(state))
+                }
         }
     }
 
     private fun teardownVpn() {
         AppLogger.log("VpnService", "teardownVpn()")
         isRunning = false
+
+        // First, so it cannot restart an engine the lines below are about to stop.
+        upstreamSupervisor?.stop()
+        upstreamSupervisor = null
 
         weightUpdateJob?.cancel()
         weightUpdateJob = null

@@ -62,6 +62,17 @@ class XrayProcess(
     fun isAlive(): Boolean = process?.isAlive == true
 
     /**
+     * Parks until the core exits or [timeoutMs] elapses; true if it exited (or was already
+     * stopped). Interruptible, so cancelling the caller ends the wait at once.
+     */
+    suspend fun awaitExit(timeoutMs: Long): Boolean =
+        runCatching {
+            kotlinx.coroutines.runInterruptible(kotlinx.coroutines.Dispatchers.IO) {
+                process?.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) ?: true
+            }
+        }.getOrDefault(false)
+
+    /**
      * Stops the core and waits (bounded) until the OS has reaped it, mirroring
      * AetherProcess.stop()'s reasoning: a fire-and-forget destroy() can leave
      * the old process still holding the local SOCKS port exactly when a

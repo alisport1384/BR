@@ -27,6 +27,10 @@ class Path3Router : PathSelector {
         AppLogger.log("Path3", "updateNetworks wifi=$wifi cellular=$cellular")
     }
 
+    /** True when [network] is the current Wi-Fi or Cellular reference (not stale/replaced/gone). */
+    fun isCurrent(network: Network?): Boolean =
+        network != null && (network == wifiNetwork || network == cellularNetwork)
+
     /** Read-only snapshot for external observers (e.g. the Virtual Bonding sandbox UI). */
     fun currentWifiNetwork(): Network? = wifiNetwork
     fun currentCellularNetwork(): Network? = cellularNetwork

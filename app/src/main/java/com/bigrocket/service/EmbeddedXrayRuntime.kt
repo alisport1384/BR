@@ -1,13 +1,18 @@
 package com.bigrocket.service
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import studio.cluvex.aether.core.NetProbe
 import studio.cluvex.aether.core.PortProbe
 import java.io.File
 
@@ -31,9 +36,22 @@ object EmbeddedXrayRuntime {
     private const val CONFIG_FILE = "xray-config.json"
     private const val STARTUP_TIMEOUT_MS = 20_000L
 
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private const val VERIFY_BUDGET_MS = 30_000L
+    private const val VERIFY_LIVENESS_CAP_MS = 14_000L
+    private const val PORT_RELEASE_TIMEOUT_MS = 3_000L
+    private const val START_SLACK_MS = 10_000L
+    private const val MONITOR_WAIT_MS = 30_000L
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Same generation scheme as EmbeddedAetherRuntime (see the long note there): a
+    // cancelled or superseded start must never touch shared state or stop a NEWER core.
+    private val lock = Any()
     private var job: Job? = null
-    private var process: XrayProcess? = null
+    private var monitorJob: Job? = null
+    @Volatile private var process: XrayProcess? = null
+    @Volatile private var generation = 0L
+    private val phase = PhaseTracker()
 
     // What the live core was started with, so applyUpstreamChoice() can detect a
     // stale instance (chain switched, or the user saved a new config) and restart it.
@@ -43,17 +61,21 @@ object EmbeddedXrayRuntime {
     private val _trafficReady = MutableStateFlow(false)
     val trafficReady: StateFlow<Boolean> = _trafficReady.asStateFlow()
 
-    // @Synchronized on start/stop: unlike Aether (started only under controlMutex), Xray
-    // has two legitimate start paths - applyUpstreamChoice() and the readiness collector's
-    // second-stage launch - which run on different coroutines. The guard below must be
-    // atomic against both, or a double core spawn would fight over the SOCKS port.
-    @Synchronized
+    // start() is reachable from two coroutines (applyUpstreamChoice() and the readiness
+    // collector's second-stage launch); the guard below is atomic under [lock] for exactly
+    // that reason - a double core spawn would fight over the SOCKS port.
     fun start(context: Context, chainPort: Int) {
-        if (job?.isActive == true || isRunning()) return
-        _trafficReady.value = false
+        val gen: Long
+        synchronized(lock) {
+            if (job?.isActive == true || isRunning()) return
+            gen = ++generation
+            _trafficReady.value = false
+            phase.set(RuntimePhase.STARTING, System.currentTimeMillis() + STARTUP_TIMEOUT_MS + START_SLACK_MS)
+        }
         val app = context.applicationContext
-        job = scope.launch {
-            runCatching {
+        val newJob = scope.launch {
+            var engine: XrayProcess? = null
+            try {
                 AppLogger.log("Xray", "starting core (socks=$SOCKS_PORT chainPort=$chainPort)")
                 val raw = XrayConfigStore.read(app)
                     ?: error("هیچ پیکربندی Xray ثبت نشده است - ابتدا کانفیگ را در صفحه اصلی ذخیره کنید")
@@ -61,51 +83,151 @@ object EmbeddedXrayRuntime {
                 val configFile = File(app.filesDir, CONFIG_FILE)
                 configFile.writeText(configJson)
 
-                val engine = XrayProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
-                process = engine
-                activeChainPort = chainPort
-                activeConfigFingerprint = raw.hashCode()
-                engine.start(configFile.absolutePath)
+                // A dying previous core may still hold the port (see the Aether runtime).
+                PortProbe.awaitClosed(SOCKS_HOST, SOCKS_PORT, PORT_RELEASE_TIMEOUT_MS)
+
+                val proc = XrayProcess(app.applicationInfo.nativeLibraryDir, app.filesDir)
+                synchronized(lock) {
+                    ensureCurrent(gen)
+                    process = proc
+                    activeChainPort = chainPort
+                    activeConfigFingerprint = raw.hashCode()
+                }
+                engine = proc
+                proc.start(configFile.absolutePath)
 
                 val open = PortProbe.awaitOpen(
                     SOCKS_HOST,
                     SOCKS_PORT,
                     STARTUP_TIMEOUT_MS,
-                    isEngineAlive = { engine.isAlive() },
+                    isEngineAlive = { proc.isAlive() },
                 )
+                ensureCurrent(gen)
                 if (!open) error("Xray SOCKS5 listener did not become ready")
-                AppLogger.log("Xray", "core ready on $SOCKS_HOST:$SOCKS_PORT (chainPort=$chainPort)")
-                _trafficReady.value = true
-            }.onFailure {
-                // it is already a Throwable (runCatching) - wrapping it in another Exception
-                // would relabel the logged error's type as generic "Exception" and bury the
-                // real one (e.g. IllegalStateException from the error()s above) as .cause.
-                AppLogger.logError("Xray", "start failed", it)
+                AppLogger.log("Xray", "core listening on $SOCKS_HOST:$SOCKS_PORT (chainPort=$chainPort)")
+
+                synchronized(lock) {
+                    ensureCurrent(gen)
+                    phase.set(RuntimePhase.VERIFYING, System.currentTimeMillis() + VERIFY_BUDGET_MS + START_SLACK_MS)
+                }
+                // A listening port proves nothing: Xray accepts SOCKS clients whether or not
+                // its server is reachable. Readiness is a real request that came back.
+                if (!verifyTunnel(proc)) {
+                    error("Xray did not carry any traffic (server unreachable or config rejected)")
+                }
+                synchronized(lock) {
+                    ensureCurrent(gen)
+                    phase.set(RuntimePhase.READY)
+                    _trafficReady.value = true
+                    monitorJob?.cancel()
+                    monitorJob = launchMonitor(gen, proc)
+                }
+                AppLogger.log("Xray", "core ready - carried a real request (chainPort=$chainPort)")
+            } catch (e: CancellationException) {
+                runCatching { engine?.stop() }
+                throw e
+            } catch (e: Throwable) {
+                handleStartFailure(gen, engine, e)
+            }
+        }
+        synchronized(lock) {
+            if (generation == gen) job = newJob else newJob.cancel()
+        }
+    }
+
+    private suspend fun verifyTunnel(proc: XrayProcess): Boolean {
+        val deadline = System.currentTimeMillis() + VERIFY_BUDGET_MS
+        while (System.currentTimeMillis() < deadline) {
+            if (!proc.isAlive()) return false
+            val alive = BoundedCall.run(VERIFY_LIVENESS_CAP_MS) {
+                NetProbe.tunnelAlive(SOCKS_HOST, SOCKS_PORT)
+            }
+            if (alive == true) return true
+            delay(2_000L)
+        }
+        return false
+    }
+
+    private fun ensureCurrent(gen: Long) {
+        if (generation != gen) throw CancellationException("superseded by a newer start/stop")
+    }
+
+    private fun handleStartFailure(gen: Long, engine: XrayProcess?, error: Throwable) {
+        val current = synchronized(lock) {
+            if (generation != gen) {
+                false
+            } else {
+                phase.set(RuntimePhase.FAILED, error = error.message ?: error.javaClass.simpleName)
                 _trafficReady.value = false
-                stopInternal()
+                if (process === engine) {
+                    process = null
+                    activeChainPort = -1
+                    activeConfigFingerprint = 0
+                }
+                monitorJob?.cancel()
+                monitorJob = null
+                true
+            }
+        }
+        // it is already a Throwable - wrapping it in another Exception would relabel the
+        // logged error's type and bury the real one as .cause.
+        runCatching { engine?.stop() }
+        if (current) AppLogger.logError("Xray", "start failed", error)
+    }
+
+    private fun launchMonitor(gen: Long, proc: XrayProcess): Job = scope.launch {
+        while (isActive) {
+            val exited = proc.awaitExit(MONITOR_WAIT_MS)
+            if (!isActive) return@launch
+            if (exited || !proc.isAlive()) {
+                val died = synchronized(lock) {
+                    if (generation != gen || process !== proc || phase.phase() != RuntimePhase.READY) {
+                        false
+                    } else {
+                        phase.set(RuntimePhase.FAILED, error = "core exited unexpectedly")
+                        _trafficReady.value = false
+                        process = null
+                        true
+                    }
+                }
+                if (died) {
+                    AppLogger.log("Xray", "core process exited while carrying traffic")
+                    runCatching { proc.stop() }
+                }
+                return@launch
             }
         }
     }
 
-    @Synchronized
     fun stop() {
-        _trafficReady.value = false
-        job?.cancel()
-        job = null
-        stopInternal()
+        val oldJob: Job?
+        val oldMonitor: Job?
+        val oldProcess: XrayProcess?
+        synchronized(lock) {
+            generation++ // invalidates any coroutine still working for the old attempt
+            _trafficReady.value = false
+            oldJob = job
+            job = null
+            oldMonitor = monitorJob
+            monitorJob = null
+            oldProcess = process
+            process = null
+            activeChainPort = -1
+            activeConfigFingerprint = 0
+            phase.set(RuntimePhase.IDLE)
+        }
+        oldJob?.cancel()
+        oldMonitor?.cancel()
+        runCatching { oldProcess?.stop() }
         AppLogger.log("Xray", "core stopped")
-    }
-
-    private fun stopInternal() {
-        runCatching { process?.stop() }
-        process = null
-        activeChainPort = -1
-        activeConfigFingerprint = 0
     }
 
     fun isRunning(): Boolean = process?.isAlive() == true
 
     fun isTrafficReady(): Boolean = _trafficReady.value
+
+    /** Phase snapshot for the supervisor. */
+    fun status(): RuntimeStatus = phase.snapshot(isRunning())
 
     /**
      * True when a live core no longer matches the desired chain target or the

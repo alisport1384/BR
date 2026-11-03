@@ -295,6 +295,16 @@
                 android:textColor="@color/br_text_primary"
                 android:textSize="15sp" />
 
+            <TextView
+                android:id="@+id/tvUpstreamStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                android:text=""
+                android:textColor="@color/br_accent_error"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
             <Button
                 android:id="@+id/btnToggleVpn"
                 android:layout_width="match_parent"

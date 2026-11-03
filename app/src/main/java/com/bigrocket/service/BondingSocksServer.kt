@@ -46,6 +46,13 @@ class BondingSocksServer(
         /** 127.0.0.1-only; picked to avoid AetherUpstream's own 1819 and any other local port. */
         const val PORT = 12347
         private const val CONNECT_TIMEOUT_MS = 5000
+        // Per-attempt bound while another path is still left to try: a path that is
+        // timing out right now must not eat the whole budget the engine's own connect
+        // is willing to wait before the other path even gets its turn.
+        private const val FALLBACK_CONNECT_TIMEOUT_MS = 3000
+        // Consecutive failed UDP sends on the pinned socket before the association is
+        // moved to a path that works (a dead Network object fails every send).
+        private const val UDP_SEND_FAILURES_TO_REPIN = 3
         // Section: bounds how long a TCP relay direction blocks with no data at all after the
         // connection is established - separate from CONNECT_TIMEOUT_MS, which only bounds the
         // initial handshake. Well under Aether's own ~90s internal TLS-handshake timeout
@@ -71,7 +78,17 @@ class BondingSocksServer(
      * path that just went bad - mirrors NetworkSessionTracker's role for the old router. */
     private val activeRelays = ConcurrentHashMap<Int, ActiveRelay>()
 
-    private class ActiveRelay(@Volatile var network: Network?, val close: () -> Unit)
+    /**
+     * [repin] is non-null only for UDP associations: the engine keeps using the local UDP
+     * port it was given even after it closes the control connection, so tearing the
+     * association down leaves it sending into a closed port. Such a relay is moved to a
+     * different physical path in place instead; TCP relays have no such option and close.
+     */
+    private class ActiveRelay(
+        @Volatile var network: Network?,
+        val repin: (() -> Unit)? = null,
+        val close: () -> Unit,
+    )
 
     fun start() {
         if (serverSocket != null) return
@@ -100,6 +117,29 @@ class BondingSocksServer(
 
     fun updateNetworks(wifi: Network?, cellular: Network?) {
         path3Router.updateNetworks(wifi, cellular)
+        // A relay pinned to a Network that is gone or has been replaced by a new object
+        // (Wi-Fi reconnect, cellular handover) can never carry another byte - its socket
+        // is bound to the dead one - yet nothing used to notice: the health hysteresis only
+        // evicted on a probe-confirmed failure of a still-present Network, never on the
+        // Network disappearing outright. The engine's tunnel then stayed wedged on it even
+        // after connectivity returned.
+        val current = setOfNotNull(wifi, cellular)
+        evictRelays { it !in current }
+    }
+
+    private fun evictRelays(shouldEvict: (Network) -> Boolean) {
+        activeRelays.entries.toList().forEach { (id, relay) ->
+            val pinned = relay.network ?: return@forEach
+            if (!shouldEvict(pinned)) return@forEach
+            val repin = relay.repin
+            if (repin != null) {
+                relay.network = null
+                runCatching { repin() }
+            } else {
+                runCatching { relay.close() }
+                activeRelays.remove(id)
+            }
+        }
     }
 
     fun updateWeights(wifiW: Int, cellularW: Int) {
@@ -116,12 +156,7 @@ class BondingSocksServer(
      * immediately instead of leaving it to fail silently - see the extended reasoning on
      * TunPacketRouter.notifySoftFailure itself, which applies identically here. */
     fun notifySoftFailure(deadNetwork: Network) {
-        activeRelays.entries.toList().forEach { (id, relay) ->
-            if (relay.network == deadNetwork) {
-                runCatching { relay.close() }
-                activeRelays.remove(id)
-            }
-        }
+        evictRelays { it == deadNetwork }
     }
 
     /** Deterministic best-path pick. This class has exactly one instance
@@ -236,33 +271,8 @@ class BondingSocksServer(
                 // GOOL/TCP tunnel is one long-lived connection for the whole session, same as
                 // the UDP-associate case above - a single weighted-random sample would just as
                 // often pin the whole session to the low-weight path. See pickBestNetwork's doc.
-                val picked = pickBestNetwork() ?: throw IOException("No usable network")
-                AppLogger.log(
-                    "Path3",
-                    "TCP CONNECT pin chosen=${path3Router.describeNetwork(picked)} wifiWeight=$wifiWeight cellularWeight=$cellularWeight dest=$destHost:$destPort",
-                )
+                val (picked, socket) = connectViaNetworks(destHost, destPort)
                 network = picked
-                // Protecting a socket only prevents VPN recursion; it does NOT select the
-                // physical uplink. The selected Network must create/bind the socket, otherwise
-                // Android is free to use the default network (typically Wi-Fi), defeating
-                // BigRocket's path selection.
-                val socket = networkSocket(picked)
-                if (!vpnService.protect(socket)) throw IOException("Unable to protect TCP socket from VPN")
-                socket.tcpNoDelay = true
-                // Resolve destHost via picked.getAllByName(), not InetSocketAddress(String, Int)
-                // - the latter uses the system-default DNS resolver, which is not bound to
-                // `picked` (or to any protected socket) at all. A SOCKS5 client that sends a
-                // hostname rather than a pre-resolved IP (reqwest's SOCKS5 support does exactly
-                // this) would then have its DNS lookup go through an unrelated, unprotected
-                // path - independent of whatever weight/network was actually selected for the
-                // data connection, and liable to recurse into this VPN's own TUN. Network.getAllByName
-                // is safe to call unconditionally: for an already-literal IP it just parses it,
-                // same as InetAddress.getByName would, with no real query.
-                val resolved = picked.getAllByName(destHost).firstOrNull()
-                    ?: throw IOException("DNS resolution failed for $destHost on ${path3Router.describeNetwork(picked)}")
-                AppLogger.log("Path3", "resolved $destHost -> ${resolved.hostAddress} via ${path3Router.describeNetwork(picked)}")
-                socket.connect(InetSocketAddress(resolved, destPort), CONNECT_TIMEOUT_MS)
-                socket.soTimeout = RELAY_READ_TIMEOUT_MS
                 remote = socket
             }
         } catch (_: Exception) {
@@ -298,6 +308,64 @@ class BondingSocksServer(
         activeRelays.remove(relayId)
         runCatching { remote.close() }
         closeQuietly(client)
+    }
+
+    /**
+     * Opens the TCP connection on the best path and, if that path fails or times out, on
+     * the other one. Previously a path that was timing out at that instant failed the
+     * request outright - and a long-lived tunnel connection that fails to open is exactly
+     * what leaves the engine "connecting" until a path happens to recover.
+     */
+    private suspend fun connectViaNetworks(destHost: String, destPort: Int): Pair<Network, Socket> {
+        val first = pickBestNetwork() ?: throw IOException("No usable network")
+        val candidates = listOf(first) + path3Router.allNetworksSorted().filter { it != first }
+        var lastError: Exception? = null
+        for ((index, picked) in candidates.withIndex()) {
+            val timeoutMs = if (index < candidates.lastIndex) FALLBACK_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+            var socket: Socket? = null
+            try {
+                AppLogger.log(
+                    "Path3",
+                    "TCP CONNECT pin chosen=${path3Router.describeNetwork(picked)} wifiWeight=$wifiWeight cellularWeight=$cellularWeight dest=$destHost:$destPort",
+                )
+                // Protecting a socket only prevents VPN recursion; it does NOT select the
+                // physical uplink. The selected Network must create/bind the socket, otherwise
+                // Android is free to use the default network (typically Wi-Fi), defeating
+                // BigRocket's path selection.
+                val s = networkSocket(picked)
+                socket = s
+                if (!vpnService.protect(s)) throw IOException("Unable to protect TCP socket from VPN")
+                s.tcpNoDelay = true
+                // Resolve destHost via picked.getAllByName(), not InetSocketAddress(String, Int)
+                // - the latter uses the system-default DNS resolver, which is not bound to
+                // `picked` (or to any protected socket) at all. A SOCKS5 client that sends a
+                // hostname rather than a pre-resolved IP (reqwest's SOCKS5 support does exactly
+                // this) would then have its DNS lookup go through an unrelated, unprotected
+                // path - independent of whatever weight/network was actually selected for the
+                // data connection, and liable to recurse into this VPN's own TUN. A literal IP
+                // involves no query; a real lookup on a dead network can block for a long
+                // time, so it is bounded.
+                val isLiteral = !destHost.any { it.isLetter() } || destHost.contains(':')
+                val resolved = if (isLiteral) {
+                    picked.getAllByName(destHost).firstOrNull()
+                } else {
+                    BoundedCall.run(timeoutMs.toLong()) { picked.getAllByName(destHost).firstOrNull() }
+                } ?: throw IOException("DNS resolution failed for $destHost on ${path3Router.describeNetwork(picked)}")
+                AppLogger.log("Path3", "resolved $destHost -> ${resolved.hostAddress} via ${path3Router.describeNetwork(picked)}")
+                s.connect(InetSocketAddress(resolved, destPort), timeoutMs)
+                s.soTimeout = RELAY_READ_TIMEOUT_MS
+                return picked to s
+            } catch (e: Exception) {
+                runCatching { socket?.close() }
+                lastError = e
+                AppLogger.log(
+                    "Path3",
+                    "TCP CONNECT via ${path3Router.describeNetwork(picked)} failed (${e.javaClass.simpleName}: ${e.message})" +
+                        if (index < candidates.lastIndex) " - trying the other path" else "",
+                )
+            }
+        }
+        throw lastError ?: IOException("No usable network")
     }
 
     private fun networkSocket(network: Network): Socket =
@@ -373,6 +441,10 @@ class BondingSocksServer(
         var pinnedSocket: DatagramSocket? = null
         var pinnedNetwork: Network? = null
         var receiverJob: Job? = null
+        // Set from other threads (network change / soft failure) to ask the loop below to
+        // move this association to another physical path; consumed on the next packet.
+        val repinRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+        var sendFailures = 0
 
         fun bindPinnedSocket(network: Network): DatagramSocket? = runCatching {
             val s = DatagramSocket()
@@ -426,12 +498,31 @@ class BondingSocksServer(
         // Registered once the pinned path is known (first packet); a soft-failure on that
         // specific Network then tears this association down like any single-path relay,
         // letting the tunnel reconnect and get a fresh weighted pick on the surviving path.
-        activeRelays[relayId] = ActiveRelay(null) {
+        activeRelays[relayId] = ActiveRelay(
+            network = null,
+            repin = { repinRequested.set(true) },
+        ) {
             runCatching { client.close() }
             runCatching { localUdp.close() }
             runCatching { aetherAssociation?.close() }
             runCatching { pinnedSocket?.close() }
             receiverJob?.cancel()
+        }
+
+        // Drops the current pin (socket + receiver) so the next packet picks a path again.
+        // Safe to call only from the association loop below, which owns these variables.
+        fun unpin(reason: String) {
+            AppLogger.log(
+                "Path3",
+                "UDP ASSOCIATE unpin from ${path3Router.describeNetwork(pinnedNetwork)}: $reason",
+            )
+            receiverJob?.cancel()
+            receiverJob = null
+            runCatching { pinnedSocket?.close() }
+            pinnedSocket = null
+            pinnedNetwork = null
+            sendFailures = 0
+            activeRelays[relayId]?.network = null
         }
 
         val buffer = ByteArray(64 * 1024)
@@ -469,6 +560,19 @@ class BondingSocksServer(
                     continue
                 }
 
+                // The association outlives any single physical network: if the one it is
+                // pinned to was lost, replaced or flagged failed, move it - the engine keeps
+                // using this same local UDP port and cannot do it for us.
+                if (pinnedSocket != null) {
+                    if (repinRequested.getAndSet(false)) {
+                        unpin("path changed or failed")
+                    } else if (!path3Router.isCurrent(pinnedNetwork)) {
+                        unpin("pinned network no longer current")
+                    }
+                } else {
+                    repinRequested.set(false)
+                }
+
                 if (pinnedSocket == null) {
                     val network = pickBestNetwork() ?: continue // both paths down - drop, same as before
                     AppLogger.log(
@@ -482,13 +586,20 @@ class BondingSocksServer(
                     receiverJob = startPinnedReceiver(socket, decoded.host, decoded.port, fromAddr)
                 }
                 val socket = pinnedSocket ?: continue
-                runCatching {
+                val sent = runCatching {
                     val resolvedAddr = pinnedNetwork?.getAllByName(decoded.host)?.firstOrNull()
                         ?: InetAddress.getByName(decoded.host)
                     val dest = InetSocketAddress(resolvedAddr, decoded.port)
                     socket.send(DatagramPacket(decoded.payload, decoded.payload.size, dest))
+                }.isSuccess
+                if (sent) {
+                    sendFailures = 0
+                    TrafficStats.recordBytes(decoded.payload.size)
+                } else if (++sendFailures >= UDP_SEND_FAILURES_TO_REPIN) {
+                    // Every send failing means the pinned Network object is dead even if
+                    // Android still reports it; do not keep feeding it.
+                    unpin("$sendFailures consecutive send failures")
                 }
-                TrafficStats.recordBytes(decoded.payload.size)
             }
         } finally {
             controlWatcher.cancel()
