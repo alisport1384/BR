@@ -22,7 +22,6 @@ import studio.cluvex.aether.model.ConnectionProfile
 import studio.cluvex.aether.model.ConnectionState
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -144,7 +143,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
     // TcpRelayEngine.kt/UdpRelayEngine.kt/TunPacketRouter.kt - this scope now only
     // hosts the weight-update loop, but a plain Job here has the same failure-cascades
     // risk for anything else launched on it in the future.
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Dedicated control-plane threads, NOT Dispatchers.IO: see ControlDispatchers for why a
+    // jammed data plane used to freeze everything launched from here (retry countdown, weight
+    // loop, notification updates, control ops).
+    private val serviceScope = CoroutineScope(ControlDispatchers.control + SupervisorJob())
     private var weightUpdateJob: Job? = null
     // Separate, much slower loop (see startLossProbing()): measured far less often than
     // latency, so the 1s weight-update loop reads these cached values rather than
@@ -926,10 +928,10 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 // down exactly the failover this loop exists to drive.
                 val (wifiLatency, cellularLatency) = coroutineScope {
                     val wifiDeferred = wifi?.let {
-                        async(Dispatchers.IO) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
+                        async(ControlDispatchers.probe) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
                     }
                     val cellularDeferred = cellular?.let {
-                        async(Dispatchers.IO) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
+                        async(ControlDispatchers.probe) { LatencyTester.testLatency(this@BigRocketVpnService, it) }
                     }
                     Pair(
                         wifiDeferred?.await() ?: LatencyTester.FAILURE,
@@ -1066,8 +1068,8 @@ class BigRocketVpnService : VpnService(), NetworkMonitor.NetworkStateListener {
                 val wifi = wifiNetwork
                 val cellular = cellularNetwork
                 coroutineScope {
-                    val wifiDeferred = wifi?.let { async(Dispatchers.IO) { LatencyTester.testLossRate(this@BigRocketVpnService, it) } }
-                    val cellularDeferred = cellular?.let { async(Dispatchers.IO) { LatencyTester.testLossRate(this@BigRocketVpnService, it) } }
+                    val wifiDeferred = wifi?.let { async(ControlDispatchers.probe) { LatencyTester.testLossRate(this@BigRocketVpnService, it) } }
+                    val cellularDeferred = cellular?.let { async(ControlDispatchers.probe) { LatencyTester.testLossRate(this@BigRocketVpnService, it) } }
                     wifiDeferred?.await()?.let { wifiLossRate = it }
                     cellularDeferred?.await()?.let { cellularLossRate = it }
                 }

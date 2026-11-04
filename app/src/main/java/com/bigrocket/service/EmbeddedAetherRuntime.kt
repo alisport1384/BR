@@ -3,7 +3,6 @@ package com.bigrocket.service
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -28,7 +27,7 @@ import studio.cluvex.aether.model.Protocol
 /** Runs Aether in embedded proxy mode so BigRocket remains the only Android VPN. */
 object EmbeddedAetherRuntime {
     // SupervisorJob: one failed child must never cancel the scope for every later start().
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(ControlDispatchers.control + SupervisorJob())
 
     // Guards job/process/generation and every state mutation made on behalf of a start().
     private val lock = Any()
@@ -358,13 +357,14 @@ object EmbeddedAetherRuntime {
     /**
      * Notices the engine dying AFTER it was declared ready (crash, OOM kill, its own fatal
      * error). Nothing watched the process in the embedded runtime, so trafficReady stayed
-     * true and the TUN kept feeding a dead listener. Parks on the OS (no polling).
+     * true and the TUN kept feeding a dead listener.
      */
     private fun launchMonitor(gen: Long, proc: AetherProcess): Job = scope.launch {
+        // A once-a-second isAlive() check on the control pool: it needs no blocking wait
+        // (which would sit on a thread of its own) and ends within a second of the death.
         while (isActive) {
-            val exited = proc.awaitExit(MONITOR_WAIT_MS)
-            if (!isActive) return@launch
-            if (exited || !proc.isAlive()) {
+            delay(MONITOR_POLL_MS)
+            if (!proc.isAlive()) {
                 onEngineDied(gen, proc)
                 return@launch
             }
@@ -434,5 +434,5 @@ object EmbeddedAetherRuntime {
     /** Phase snapshot for the supervisor. */
     fun status(): RuntimeStatus = phase.snapshot(isRunning())
 
-    private const val MONITOR_WAIT_MS = 30_000L
+    private const val MONITOR_POLL_MS = 1_000L
 }

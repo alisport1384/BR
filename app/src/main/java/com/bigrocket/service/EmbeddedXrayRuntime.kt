@@ -3,7 +3,6 @@ package com.bigrocket.service
 import android.content.Context
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -40,9 +39,9 @@ object EmbeddedXrayRuntime {
     private const val VERIFY_LIVENESS_CAP_MS = 14_000L
     private const val PORT_RELEASE_TIMEOUT_MS = 3_000L
     private const val START_SLACK_MS = 10_000L
-    private const val MONITOR_WAIT_MS = 30_000L
+    private const val MONITOR_POLL_MS = 1_000L
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(ControlDispatchers.control + SupervisorJob())
 
     // Same generation scheme as EmbeddedAetherRuntime (see the long note there): a
     // cancelled or superseded start must never touch shared state or stop a NEWER core.
@@ -177,25 +176,23 @@ object EmbeddedXrayRuntime {
 
     private fun launchMonitor(gen: Long, proc: XrayProcess): Job = scope.launch {
         while (isActive) {
-            val exited = proc.awaitExit(MONITOR_WAIT_MS)
-            if (!isActive) return@launch
-            if (exited || !proc.isAlive()) {
-                val died = synchronized(lock) {
-                    if (generation != gen || process !== proc || phase.phase() != RuntimePhase.READY) {
-                        false
-                    } else {
-                        phase.set(RuntimePhase.FAILED, error = "core exited unexpectedly")
-                        _trafficReady.value = false
-                        process = null
-                        true
-                    }
+            delay(MONITOR_POLL_MS)
+            if (proc.isAlive()) continue
+            val died = synchronized(lock) {
+                if (generation != gen || process !== proc || phase.phase() != RuntimePhase.READY) {
+                    false
+                } else {
+                    phase.set(RuntimePhase.FAILED, error = "core exited unexpectedly")
+                    _trafficReady.value = false
+                    process = null
+                    true
                 }
-                if (died) {
-                    AppLogger.log("Xray", "core process exited while carrying traffic")
-                    runCatching { proc.stop() }
-                }
-                return@launch
             }
+            if (died) {
+                AppLogger.log("Xray", "core process exited while carrying traffic")
+                runCatching { proc.stop() }
+            }
+            return@launch
         }
     }
 

@@ -3,7 +3,6 @@ package com.bigrocket.service
 import android.net.Network
 import java.net.InetSocketAddress
 import java.net.Socket
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -75,7 +74,7 @@ object LatencyTester {
         probeCount: Int = 8,
     ): Double = coroutineScope {
         val results = (1..probeCount).map {
-            async(Dispatchers.IO) {
+            async(ControlDispatchers.probe) {
                 testLatency(vpnService, network, targetHost, port, timeoutMs) != FAILURE
             }
         }.awaitAll()

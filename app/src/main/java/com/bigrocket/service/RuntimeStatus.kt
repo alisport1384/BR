@@ -1,6 +1,5 @@
 package com.bigrocket.service
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
@@ -80,10 +79,14 @@ internal object BoundedCall {
     )
 
     /** The block's result, or null when it returned null, threw, or did not finish in time. */
-    suspend fun <T : Any> run(timeoutMs: Long, block: () -> T?): T? {
+    suspend fun <T : Any> run(
+        timeoutMs: Long,
+        waitOn: kotlinx.coroutines.CoroutineDispatcher = ControlDispatchers.control,
+        block: () -> T?,
+    ): T? {
         val future = pool.submit(Callable { block() })
         try {
-            return runInterruptible(Dispatchers.IO) {
+            return runInterruptible(waitOn) {
                 try {
                     future.get(timeoutMs, TimeUnit.MILLISECONDS)
                 } catch (_: TimeoutException) {

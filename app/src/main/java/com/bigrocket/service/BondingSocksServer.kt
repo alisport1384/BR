@@ -3,7 +3,6 @@ package com.bigrocket.service
 import android.net.Network
 import android.net.VpnService
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
@@ -69,7 +68,9 @@ class BondingSocksServer(
     @Volatile private var upstreamMode = UpstreamMode.NONE
 
     private val relayIdCounter = AtomicInteger(0)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Own threads (see ControlDispatchers): the engines' outbound must not queue behind the
+    // packet router's sessions for a thread.
+    private val scope = CoroutineScope(ControlDispatchers.relay + SupervisorJob())
     private var serverSocket: ServerSocket? = null
     private var acceptJob: Job? = null
 
@@ -349,7 +350,7 @@ class BondingSocksServer(
                 val resolved = if (isLiteral) {
                     picked.getAllByName(destHost).firstOrNull()
                 } else {
-                    BoundedCall.run(timeoutMs.toLong()) { picked.getAllByName(destHost).firstOrNull() }
+                    BoundedCall.run(timeoutMs.toLong(), ControlDispatchers.relay) { picked.getAllByName(destHost).firstOrNull() }
                 } ?: throw IOException("DNS resolution failed for $destHost on ${path3Router.describeNetwork(picked)}")
                 AppLogger.log("Path3", "resolved $destHost -> ${resolved.hostAddress} via ${path3Router.describeNetwork(picked)}")
                 s.connect(InetSocketAddress(resolved, destPort), timeoutMs)
